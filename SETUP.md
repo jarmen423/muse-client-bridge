@@ -18,6 +18,12 @@ cargo build --release
 # binary: ./target/release/muse-bridge
 ```
 
+Or skip the toolchain: download `muse-bridge-<os>-<arch>` from the
+latest [GitHub Release](https://github.com/jarmen423/muse-client-bridge/releases),
+`chmod +x` it on Linux/macOS, and run it. Windows users should run
+the Linux binary inside WSL2 (Meta ships no native Windows `muse`
+CLI, so a native bridge binary would have nothing to drive).
+
 ## First run and verify
 
 ```sh
@@ -135,3 +141,16 @@ Desktop after writing.
 
 `muse-bridge --support` prints a JSON bundle (versions, fingerprint
 pin vs live, stderr tail) for bug reports.
+
+## Cutting a release
+
+Push a tag; CI builds Linux, Windows, and macOS binaries, smoke
+tests each, and attaches them to the release:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Re-running a failed release is safe (assets upload with `--clobber`).
+Every push and PR also runs the test/clippy/fmt gates on Linux plus a
+Windows compile check.

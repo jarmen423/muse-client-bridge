@@ -1,0 +1,32 @@
+# CI: the AGENTS.md gates on every push and PR.
+#
+# Live-host tests self-skip (no MUSE_LIVE_TESTS here), so this is
+# credential-free. The Windows job compiles only: the scripted tests
+# shell out to `python3`/`sh`, which stock Windows runners lack;
+# Windows binaries are compiled again by release.yml on tags.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo test
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  windows-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: cargo check --all-targets --target x86_64-pc-windows-msvc
