@@ -1,0 +1,42 @@
+[package]
+name = "muse-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Localhost OpenAI-compatible HTTP API driving `muse serve` over MSP/stdio"
+license = "MIT"
+
+[[bin]]
+name = "muse-bridge"
+path = "src/main.rs"
+
+[lib]
+name = "muse_bridge"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures = "0.3"
+# Justified additions (beyond the AGENTS.md locked set):
+# - base64: validate `data:`-URL image payloads (MSP rejects invalid base64
+#   with invalidParams; hand-rolling base64 is error-prone).
+# - reqwest (rustls, no OpenSSL build dependency): fetch http(s) `image_url`
+#   parts per SPEC §5.1 (timeout + size cap). Minimal features: rustls-tls
+#   (pure-Rust TLS with WebPKI roots) + stream (capped body reads) + json
+#   (serde helpers, also used by the HTTP compat tests);
+#   env-proxy support is built in.
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"

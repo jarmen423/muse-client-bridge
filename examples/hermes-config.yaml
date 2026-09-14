@@ -1,0 +1,21 @@
+# Hermes: use the Muse Bridge as a custom provider.
+#
+# Merge into Hermes's config.yaml, then start the bridge:
+#
+#   muse-bridge --port 17489
+#
+# Shape verified against hermes-agent evals/provider_wire/issue_103944.py
+# @ reference-cache fetch date: `model.provider: custom:<name>` selects the
+# entry in `custom_providers[]`, and Hermes fetches the model list from
+# {base_url}/models (providers/base.py fetch_models). The bridge needs no
+# API key; keep a placeholder only if your Hermes build requires the key.
+
+model:
+  provider: "custom:muse-bridge"
+  default: "muse-spark-1.3"
+  base_url: "http://127.0.0.1:17489/v1"
+
+custom_providers:
+  - name: "muse-bridge"
+    base_url: "http://127.0.0.1:17489/v1"
+    models: ["muse-spark-1.3", "muse-spark-1.2"]

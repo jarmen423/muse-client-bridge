@@ -1,0 +1,20 @@
+# Codex CLI: use the Muse Bridge as a custom provider.
+#
+# Copy the [model_providers.muse_bridge] table (and the two root keys) into
+# ~/.codex/config.toml, then start the bridge:
+#
+#   muse-bridge --port 17489
+#
+# Shape verified against codex-rs/model-provider-info/src/lib.rs
+# (ModelProviderInfo) @ reference-cache fetch date. The bridge ignores
+# Authorization entirely, so no API key is needed; if your Codex build
+# insists on one, uncomment env_key and export a dummy value.
+
+model_provider = "muse_bridge"
+model = "muse-spark-1.3"
+
+[model_providers.muse_bridge]
+name = "Muse Bridge (local subscription proxy)"
+base_url = "http://127.0.0.1:17489/v1"
+wire_api = "responses"
+# env_key = "MUSE_BRIDGE_DUMMY_KEY"
