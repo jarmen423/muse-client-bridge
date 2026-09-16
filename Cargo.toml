@@ -10,6 +10,10 @@ license = "MIT"
 name = "muse-bridge"
 path = "src/main.rs"
 
+[[bin]]
+name = "muse-acp-bridge"
+path = "src/bin/acp_main.rs"
+
 [lib]
 name = "muse_bridge"
 path = "src/lib.rs"
@@ -32,8 +36,13 @@ futures = "0.3"
 #   (pure-Rust TLS with WebPKI roots) + stream (capped body reads) + json
 #   (serde helpers, also used by the HTTP compat tests);
 #   env-proxy support is built in.
+# - ring: audited SHA-256 for JetBrains AIR fork-point fingerprints
+#   (`sha256:<hex>` over agent message text, FORK_PLAN P3). Already in the
+#   dependency tree via rustls, so this direct edge adds zero new packages;
+#   hand-rolling SHA-256 (muse-acp's sha256.rs) is out of the question.
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+ring = "0.17"
 
 [lints.rust]
 unsafe_code = "warn"

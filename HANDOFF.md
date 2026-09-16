@@ -18,10 +18,15 @@ the next.
 3. [PRD.md](/home/josh/code/muse-client-bridge/PRD.md) — original goals (context only).
 4. `.cache/reference/README.md` — what's cached where.
 
-## Current state
+## Current state (refreshed 2026-09-16, FORK_PLAN P6)
 
-- **Code:** none. No `Cargo.toml`, no `src/`. Greenfield.
-- **Docs:** PRD, SPEC, README, AGENTS.md written and consistent.
+- **Code:** ~14.9k lines of `src/`. Two binaries: `muse-bridge`
+  (HTTP P0–P7 per the packets below) + `muse-acp-bridge` (ACP
+  surface, FORK_PLAN P1–P5 done, P6 in progress — new `src/acp/`,
+  `src/bin/acp_main.rs`, `tests/acp-*`, `tests/acp-protocol/`).
+  Rollback for ACP is deletion of those paths; HTTP/MSP core untouched.
+- **Docs:** PRD, SPEC, README, AGENTS.md, SETUP.md written and
+  consistent; FORK_PLAN.md governs the ACP surface.
 - **Cache:** `.cache/reference/` (470 MB, git-ignored). Do NOT re-fetch,
   commit, or modify it.
 - **Verified live** (muse 1.2.1): handshake + fingerprint
@@ -40,6 +45,11 @@ reader trichotomy, UUIDv7 minter, per-method timeouts, fold
 idempotency sets, compat table, exit discipline (full reuse list in
 the research notes summarized by SPEC §4–§5). Rationale recorded —
 do not re-open without new evidence.
+
+Superseded **for the ACP surface only** by FORK_PLAN.md (2026-09-16):
+the ACP adapter logic is ported onto the tokio core, transcripts are
+vendored under `tests/acp-protocol/`, and the tokio core stays. This
+section still holds for the core.
 
 ## Global gates (every packet)
 

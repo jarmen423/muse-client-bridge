@@ -342,6 +342,7 @@ fn handshake_json(info: &HandshakeInfo) -> serde_json::Value {
         "fingerprint": info.fingerprint,
         "compat": compat_label(&info.compat),
         "durability": info.durability,
+        "granted_capabilities": info.granted_capabilities,
     })
 }
 
@@ -463,6 +464,7 @@ mod tests {
             fingerprint: Some(PINNED_FINGERPRINT.to_string()),
             compat: CompatStatus::Tested,
             durability: None,
+            granted_capabilities: vec!["userShell".to_string()],
         };
         let value = handshake_json(&info);
         assert_eq!(value["reachable"], true);

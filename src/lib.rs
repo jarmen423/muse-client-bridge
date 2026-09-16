@@ -5,6 +5,7 @@
 //! stdio, `translate`/`dispatch` map OpenAI requests onto MSP turns, and
 //! `http` serves the public surface.
 
+pub mod acp;
 pub mod cli;
 pub mod dispatch;
 pub mod http;

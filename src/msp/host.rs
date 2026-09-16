@@ -136,6 +136,10 @@ pub struct HandshakeInfo {
     /// `sessionDurability`: absent means durable; unknown values carry no
     /// recovery guarantee and fail closed like ephemeral.
     pub durability: Option<String>,
+    /// `grantedCapabilities`: the negotiated grant subset, fixed for the
+    /// connection lifetime. Unknown entries never appear (the host simply
+    /// withholds them); an absent member reads as no grants.
+    pub granted_capabilities: Vec<String>,
 }
 
 impl HandshakeInfo {
@@ -149,6 +153,15 @@ impl HandshakeInfo {
     /// `name/version` label for logs.
     pub fn host_label(&self) -> String {
         format!("{}/{}", self.server_name, self.server_version)
+    }
+
+    /// Whether the host granted the `userShell` capability at `initialize`
+    /// (gates `session/userShell`; enforced host-side, recorded here for
+    /// diagnostics and honest ACP behavior).
+    pub fn supports_user_shell(&self) -> bool {
+        self.granted_capabilities
+            .iter()
+            .any(|cap| cap == "userShell")
     }
 }
 
@@ -212,13 +225,14 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Handshake: bounded startup, room for a cold binary start.
         "initialize" => 30_000,
         // Lifecycle/history work can page and replay large views.
-        "session/start" | "session/resume" | "session/fork" | "session/read" | "view/page" => {
-            180_000
-        }
+        "session/start" | "session/resume" | "session/fork" | "session/read"
+        | "session/compact" | "view/page" | "item/readOutput" => 180_000,
         // Cheap queries.
-        "model/list" | "session/list" | "view/unsubscribe" => 30_000,
+        "model/list" | "session/list" | "view/subscribe" | "view/unsubscribe" => 30_000,
         // Control-plane decisions should be fast but not flaky.
         "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify" => 30_000,
+        // Turn control (start/steer/interrupt/cancel/unqueue), model/effort
+        // selection, and rename/userShell ride the 60 s default.
         _ => DEFAULT_TIMEOUT_MS,
     }
 }
@@ -365,6 +379,9 @@ impl MspConnection {
                 "name": "muse_bridge",
                 "version": env!("CARGO_PKG_VERSION"),
             },
+            "capabilities": {
+                "requestedCapabilities": ["userShell"],
+            },
         });
         let result = self
             .command("initialize", &params)
@@ -377,6 +394,7 @@ impl MspConnection {
             fingerprint = %info.fingerprint.as_deref().unwrap_or("absent"),
             compat = ?info.compat,
             durability = %info.durability.as_deref().unwrap_or("durable(absent)"),
+            granted = ?info.granted_capabilities,
             "msp handshake complete"
         );
         if info.compat == CompatStatus::FingerprintMismatch {
@@ -723,6 +741,17 @@ fn classify_handshake(result: &Value) -> Result<HandshakeInfo, LaunchError> {
         _ => CompatStatus::FingerprintMismatch,
     };
     let server = result.get("serverInfo");
+    let granted_capabilities = result
+        .get("grantedCapabilities")
+        .and_then(Value::as_array)
+        .map(|grants| {
+            grants
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(HandshakeInfo {
         server_name: server
             .and_then(|s| s.get("name"))
@@ -741,6 +770,7 @@ fn classify_handshake(result: &Value) -> Result<HandshakeInfo, LaunchError> {
             .get("sessionDurability")
             .and_then(Value::as_str)
             .map(str::to_string),
+        granted_capabilities,
     })
 }
 
@@ -1098,15 +1128,59 @@ mod tests {
         assert_eq!(t("initialize"), Duration::from_millis(30_000));
         assert_eq!(t("session/start"), Duration::from_millis(180_000));
         assert_eq!(t("session/resume"), Duration::from_millis(180_000));
+        assert_eq!(t("session/fork"), Duration::from_millis(180_000));
         assert_eq!(t("session/read"), Duration::from_millis(180_000));
+        assert_eq!(t("session/compact"), Duration::from_millis(180_000));
         assert_eq!(t("view/page"), Duration::from_millis(180_000));
+        assert_eq!(t("item/readOutput"), Duration::from_millis(180_000));
         assert_eq!(t("model/list"), Duration::from_millis(30_000));
         assert_eq!(t("session/list"), Duration::from_millis(30_000));
+        assert_eq!(t("view/subscribe"), Duration::from_millis(30_000));
+        assert_eq!(t("view/unsubscribe"), Duration::from_millis(30_000));
         assert_eq!(t("approval/decide"), Duration::from_millis(30_000));
         assert_eq!(t("userInput/cancel"), Duration::from_millis(30_000));
         assert_eq!(t("turn/start"), Duration::from_millis(60_000));
+        assert_eq!(t("turn/steer"), Duration::from_millis(60_000));
+        assert_eq!(t("turn/interrupt"), Duration::from_millis(60_000));
         assert_eq!(t("turn/cancel"), Duration::from_millis(60_000));
+        assert_eq!(t("turn/unqueue"), Duration::from_millis(60_000));
+        assert_eq!(t("session/setModel"), Duration::from_millis(60_000));
+        assert_eq!(t("session/rename"), Duration::from_millis(60_000));
+        assert_eq!(
+            t("session/setReasoningEffort"),
+            Duration::from_millis(60_000)
+        );
+        assert_eq!(t("session/userShell"), Duration::from_millis(60_000));
         assert_eq!(t("future/method"), Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn handshake_classification_records_grants_and_gates_schema() {
+        let granted = serde_json::json!({
+            "serverInfo": {"name": "muse-session-server", "version": "1.2.1"},
+            "schema": {"version": 1, "fingerprint": PINNED_FINGERPRINT},
+            "sessionDurability": "durable",
+            "grantedCapabilities": ["userShell"],
+        });
+        let info = classify_handshake(&granted).expect("valid handshake");
+        assert_eq!(info.compat, CompatStatus::Tested);
+        assert!(info.supports_user_shell());
+        assert!(info.restartable());
+        // Absent grants read as none; the gate stays fail-closed.
+        let bare = serde_json::json!({
+            "serverInfo": {"name": "muse-session-server", "version": "1.2.1"},
+            "schema": {"version": 1, "fingerprint": "sha256:other"},
+        });
+        let info = classify_handshake(&bare).expect("valid handshake");
+        assert_eq!(info.compat, CompatStatus::FingerprintMismatch);
+        assert!(!info.supports_user_shell());
+        assert!(info.restartable(), "absent durability means durable");
+        // schema.version != 1 is fatal.
+        let bad = serde_json::json!({"schema": {"version": 2}});
+        assert!(matches!(
+            classify_handshake(&bad),
+            Err(LaunchError::IncompatibleSchema { .. })
+        ));
     }
 
     #[test]

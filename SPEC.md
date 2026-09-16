@@ -235,8 +235,10 @@ muse serve [--trust-workspace] [extra args from MUSE_SERVE_ARGS]
 
 ### 4.1 Handshake
 
-1. Send `initialize {clientInfo:{name:"muse_bridge",version:<cargo>}}`.
-   No capability requests in v1 (no `userShell` need).
+1. Send `initialize {clientInfo:{name:"muse_bridge",version:<cargo>},
+   capabilities:{requestedCapabilities:["userShell"]}}`. Unknown
+   entries are never granted (no error); record `grantedCapabilities`
+   in the handshake facts.
 2. Validate result: `schema.version == 1` else **fatal**;
    `schema.fingerprint` mismatch vs the pinned build fingerprint ⇒
    warn only (log + `X-MSP-Fingerprint-Warn` response header).
