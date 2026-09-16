@@ -41,8 +41,9 @@ const GAP_PAGE_LIMIT: u64 = 100;
 /// Request-scoped turn parameters (post-translation).
 #[derive(Debug, Clone)]
 pub struct TurnRequest {
-    /// Absolute workspace root for `session/start`.
-    pub workspace_root: String,
+    /// Absolute workspace root for `session/start` (`None` ⇒ provider
+    /// mode: the key is omitted, verified live).
+    pub workspace_root: Option<String>,
     /// Requested approval mode (verified against the fold).
     pub approval_mode: String,
     /// Model id (`None`/empty ⇒ server default, no `setModel`).
@@ -252,6 +253,24 @@ fn parse_catalog(result: &Value) -> Result<ModelCatalog, ()> {
     })
 }
 
+/// `session/start` params: `commandId` + `approvalMode`, plus
+/// `workspaceRoot` only when the operator set one. Provider mode omits
+/// the key (verified live: the host adopts `workspaceRoot: null`).
+fn session_start_params(
+    command_id: &str,
+    approval_mode: &str,
+    workspace_root: Option<&str>,
+) -> Value {
+    let mut params = serde_json::json!({
+        "commandId": command_id,
+        "approvalMode": approval_mode,
+    });
+    if let Some(root) = workspace_root {
+        params["workspaceRoot"] = Value::String(root.to_string());
+    }
+    params
+}
+
 /// Canonicalize a workspace root to an absolute path (startup-fatal on error).
 fn validate_workspace_root(path: &Path) -> Result<String, String> {
     path.canonicalize()
@@ -294,17 +313,18 @@ fn parse_release_date(date: &str) -> i64 {
 pub struct Dispatcher {
     supervisor: Arc<Supervisor>,
     models: ModelCache,
-    workspace_root: String,
+    workspace_root: Option<String>,
     approval_mode: String,
 }
 
 impl Dispatcher {
-    /// New dispatcher. The workspace root must exist (canonicalized to an
-    /// absolute path for `session/start`); the approval mode must be one of
-    /// the four wire modes. Both are startup-fatal when invalid.
+    /// New dispatcher. A set workspace root must exist (canonicalized to
+    /// an absolute path for `session/start`); `None` selects provider
+    /// mode (no `workspaceRoot` sent). The approval mode must be one of
+    /// the four wire modes. Invalid values are startup-fatal.
     pub fn new(
         supervisor: Arc<Supervisor>,
-        workspace_root: &Path,
+        workspace_root: Option<&Path>,
         approval_mode: &str,
     ) -> Result<Self, String> {
         Self::new_with_cache(supervisor, workspace_root, approval_mode, ModelCache::new())
@@ -314,11 +334,11 @@ impl Dispatcher {
     /// cache across dispatchers to prove retain-last-good).
     pub fn new_with_cache(
         supervisor: Arc<Supervisor>,
-        workspace_root: &Path,
+        workspace_root: Option<&Path>,
         approval_mode: &str,
         models: ModelCache,
     ) -> Result<Self, String> {
-        let canonical = validate_workspace_root(workspace_root)?;
+        let canonical = workspace_root.map(validate_workspace_root).transpose()?;
         if !valid_approval_mode(approval_mode) {
             return Err(format!(
                 "approval mode must be allowAll|promptUnmatched|onRequest|denyUnmatched, got '{approval_mode}'"
@@ -443,11 +463,11 @@ async fn setup_turn(
     mut events_rx: broadcast::Receiver<HostEvent>,
 ) -> Result<TurnSetup, DispatchError> {
     // 1. One session per request (stateless v1).
-    let start_params = serde_json::json!({
-        "commandId": conn.mint_command_id(),
-        "workspaceRoot": request.workspace_root,
-        "approvalMode": request.approval_mode,
-    });
+    let start_params = session_start_params(
+        &conn.mint_command_id(),
+        &request.approval_mode,
+        request.workspace_root.as_deref(),
+    );
     let start = conn
         .command_with_retry("session/start", &start_params)
         .await
@@ -1176,5 +1196,19 @@ mod tests {
         assert!(
             validate_workspace_root(&PathBuf::from("/nonexistent-root-xyz/muse-bridge")).is_err()
         );
+    }
+
+    #[test]
+    fn session_start_params_omit_workspace_root_in_provider_mode() {
+        let params = session_start_params("cmd-1", "denyUnmatched", None);
+        assert_eq!(params["commandId"], "cmd-1");
+        assert_eq!(params["approvalMode"], "denyUnmatched");
+        assert!(
+            params.get("workspaceRoot").is_none(),
+            "provider mode must omit the key, not null it: {params}"
+        );
+
+        let params = session_start_params("cmd-2", "allowAll", Some("/ws/proj"));
+        assert_eq!(params["workspaceRoot"], "/ws/proj");
     }
 }

@@ -46,9 +46,12 @@ impl TestServer {
             retry_base_delay_ms: 10,
         };
         let supervisor = Supervisor::launch(config).await.expect("launch");
-        let dispatcher =
-            Dispatcher::new(supervisor.clone(), &std::env::temp_dir(), "denyUnmatched")
-                .expect("dispatcher");
+        let dispatcher = Dispatcher::new(
+            supervisor.clone(),
+            Some(&std::env::temp_dir()),
+            "denyUnmatched",
+        )
+        .expect("dispatcher");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");

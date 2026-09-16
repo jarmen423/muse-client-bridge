@@ -45,8 +45,12 @@ pub struct Cli {
     pub allow_remote: bool,
 
     /// Workspace root handed to MSP `session/start` as `workspaceRoot`.
-    #[arg(long, default_value = ".")]
-    pub workspace_root: PathBuf,
+    ///
+    /// Omit it for provider mode: the client owns the project/workspace,
+    /// so the bridge sends no `workspaceRoot` and the host child runs
+    /// parked in an inert empty directory instead of your cwd.
+    #[arg(long)]
+    pub workspace_root: Option<PathBuf>,
 
     /// MSP session approval mode (`allowAll|promptUnmatched|onRequest|denyUnmatched`).
     #[arg(long, default_value = DEFAULT_APPROVAL_MODE)]
@@ -110,7 +114,7 @@ mod tests {
         assert_eq!(cli.port, 17489);
         assert_eq!(cli.bind, "127.0.0.1");
         assert!(!cli.allow_remote);
-        assert_eq!(cli.workspace_root, PathBuf::from("."));
+        assert!(cli.workspace_root.is_none(), "provider mode is the default");
         assert_eq!(cli.approval_mode, "denyUnmatched");
         assert_eq!(cli.muse_bin, "muse");
         assert!(!cli.trust_workspace);
@@ -142,7 +146,7 @@ mod tests {
         assert_eq!(cli.port, 8646);
         assert_eq!(cli.bind, "127.0.0.2");
         assert!(cli.allow_remote);
-        assert_eq!(cli.workspace_root, PathBuf::from("/tmp/ws"));
+        assert_eq!(cli.workspace_root, Some(PathBuf::from("/tmp/ws")));
         assert_eq!(cli.approval_mode, "promptUnmatched");
         assert_eq!(cli.muse_bin, "/opt/muse");
         assert!(cli.trust_workspace);

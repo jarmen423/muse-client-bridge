@@ -50,6 +50,17 @@ fn read_lines(path: &Path) -> Vec<String> {
 /// Supervisor + dispatcher serving `scenario`, with the fake transcript at `log`.
 /// `extra_env` overwrites (so a test can replace `FAKE_SCENARIO` wholesale).
 async fn dispatcher_for(scenario: &str, log: &Path, extra_env: &[(&str, String)]) -> Dispatcher {
+    dispatcher_for_with_workspace(scenario, log, extra_env, Some(&std::env::temp_dir())).await
+}
+
+/// [`dispatcher_for`] with an explicit workspace (`None` ⇒ provider mode:
+/// no `workspaceRoot` is sent).
+async fn dispatcher_for_with_workspace(
+    scenario: &str,
+    log: &Path,
+    extra_env: &[(&str, String)],
+    workspace: Option<&Path>,
+) -> Dispatcher {
     let mut env: HashMap<&str, String> = HashMap::from([
         ("FAKE_SCENARIO", scenario.to_string()),
         ("FAKE_LOG", log.to_string_lossy().into_owned()),
@@ -58,7 +69,7 @@ async fn dispatcher_for(scenario: &str, log: &Path, extra_env: &[(&str, String)]
         env.insert(k, v.clone());
     }
     let supervisor = Supervisor::launch(test_config(env)).await.expect("launch");
-    Dispatcher::new(supervisor, &std::env::temp_dir(), "denyUnmatched").expect("dispatcher")
+    Dispatcher::new(supervisor, workspace, "denyUnmatched").expect("dispatcher")
 }
 
 async fn chat_turn(
@@ -108,6 +119,27 @@ async fn full_turn_collects_text_and_usage() {
         "{lines:?}"
     );
     assert!(lines.iter().any(|l| l.contains("nparts=1")), "{lines:?}");
+    dispatcher.supervisor().shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_mode_turn_omits_workspace_root() {
+    let log = scratch("dispatch-provider", "log");
+    let dispatcher = dispatcher_for_with_workspace("turn-happy", &log, &[], None).await;
+    let (_, input) = chat_turn(None, "hi").await;
+    let mut handle = dispatcher.run_turn(None, input).await.expect("run");
+    let collected = collect_watchdog(&mut handle).await;
+    assert!(matches!(
+        collected.outcome,
+        Some(TurnOutcome::Completed { .. })
+    ));
+    // The fake transcript proves the omission: `ws=-` means the key was absent.
+    let lines = read_lines(&log);
+    let start = lines
+        .iter()
+        .find(|l| l.starts_with("session/start "))
+        .expect("session/start logged");
+    assert!(start.ends_with(" ws=-"), "workspaceRoot sent: {lines:?}");
     dispatcher.supervisor().shutdown().await;
 }
 
@@ -341,8 +373,12 @@ async fn models_serve_catalog_and_retain_last_good() {
     let mut config = test_config(env);
     config.timeout_override_ms = Some(200);
     let supervisor = Supervisor::launch(config).await.expect("launch");
-    let uncached =
-        D::new(supervisor.clone(), &std::env::temp_dir(), "denyUnmatched").expect("dispatcher");
+    let uncached = D::new(
+        supervisor.clone(),
+        Some(&std::env::temp_dir()),
+        "denyUnmatched",
+    )
+    .expect("dispatcher");
     let err = uncached
         .models()
         .await
@@ -352,7 +388,7 @@ async fn models_serve_catalog_and_retain_last_good() {
     // With the populated cache shared, the same silent host serves stale.
     let stale = D::new_with_cache(
         supervisor.clone(),
-        &std::env::temp_dir(),
+        Some(&std::env::temp_dir()),
         "denyUnmatched",
         dispatcher.model_cache().clone(),
     )

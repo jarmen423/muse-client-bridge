@@ -408,3 +408,16 @@ into SPEC §11.
 Release binary builds; P0–P6 gates green; P7 live + trio green;
 SPEC §9 P0–P2 pass; clippy/fmt clean. P3 results recorded. Then —
 and only then — "releasable".
+
+---
+
+## Post-P7: provider mode (2026-09-14)
+
+`--workspace-root` is now optional (default: unset). The client
+owns the project/workspace, so the bridge sends no `workspaceRoot`
+in `session/start` (verified live: the host adopts `null`) and the
+host child parks in `<temp>/muse-bridge-no-workspace` instead of
+the operator's cwd. Bare `muse-bridge` with no flags is the
+provider-shaped invocation. SPEC §4.4/§7 and SETUP updated;
+P0's `--workspace-root` (default `.`) contract above is
+superseded.

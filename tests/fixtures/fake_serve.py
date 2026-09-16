@@ -94,7 +94,7 @@ def log_method(method, params):
     elif method == "userInput/cancel":
         detail = f" ui={params.get('userInputId', '-')} reason={params.get('reason', '-')}"
     elif method == "session/start":
-        detail = f" mode={params.get('approvalMode', '-')}"
+        detail = f" mode={params.get('approvalMode', '-')} ws={params.get('workspaceRoot', '-')}"
     elif method == "session/setModel":
         detail = f" model={(params.get('model') or {}).get('modelId', '-')}"
     elif method == "view/page":

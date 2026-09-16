@@ -52,7 +52,7 @@ async fn support_bundle_marks_unreachable_host() {
 async fn selftest_passes_all_steps_on_happy_host() {
     let report = collect_selftest(
         &test_config("turn-happy"),
-        &std::env::temp_dir(),
+        Some(&std::env::temp_dir()),
         "denyUnmatched",
     )
     .await;
@@ -68,7 +68,7 @@ async fn selftest_passes_all_steps_on_happy_host() {
 async fn selftest_fails_fast_when_host_will_not_spawn() {
     let mut config = test_config("turn-happy");
     config.bin = "definitely-not-a-real-binary-xyz".to_string();
-    let report = collect_selftest(&config, &std::env::temp_dir(), "denyUnmatched").await;
+    let report = collect_selftest(&config, Some(&std::env::temp_dir()), "denyUnmatched").await;
     assert_eq!(report.steps.len(), 1);
     assert_eq!(report.steps[0].name, "handshake");
     assert!(!report.steps[0].pass);
@@ -79,7 +79,7 @@ async fn selftest_fails_fast_when_host_will_not_spawn() {
 async fn selftest_hints_login_on_auth_required_turn() {
     let report = collect_selftest(
         &test_config("turn-failed"),
-        &std::env::temp_dir(),
+        Some(&std::env::temp_dir()),
         "denyUnmatched",
     )
     .await;

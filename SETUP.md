@@ -18,11 +18,34 @@ cargo build --release
 # binary: ./target/release/muse-bridge
 ```
 
-Or skip the toolchain: download `muse-bridge-<os>-<arch>` from the
-latest [GitHub Release](https://github.com/jarmen423/muse-client-bridge/releases),
-`chmod +x` it on Linux/macOS, and run it. Windows users should run
-the Linux binary inside WSL2 (Meta ships no native Windows `muse`
-CLI, so a native bridge binary would have nothing to drive).
+Or skip the toolchain and install from a release (replace `v0.1.0`
+with the latest tag on the
+[releases page](https://github.com/jarmen423/muse-client-bridge/releases)):
+
+```sh
+# Linux (x86_64) — inside WSL2 if you are on Windows
+curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.0/muse-bridge-linux-x86_64
+curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.0/muse-bridge-linux-x86_64.sha256
+sha256sum -c muse-bridge-linux-x86_64.sha256
+chmod +x muse-bridge-linux-x86_64
+mv muse-bridge-linux-x86_64 ~/.local/bin/muse-bridge   # or anywhere on PATH
+```
+
+macOS (Apple Silicon) is the same shape with the
+`muse-bridge-macos-aarch64` asset. The binary is unsigned, so on
+first run macOS may refuse it: right-click it in Finder, choose
+Open, and confirm — or run
+`xattr -d com.apple.quarantine ~/.local/bin/muse-bridge`.
+
+Windows users should run the Linux binary inside WSL2 (Meta ships
+no native Windows `muse` CLI, so a native bridge binary would have
+nothing to drive). Clients on the Windows side still point at
+`http://127.0.0.1:17489/v1`; WSL2 forwards localhost.
+
+The one prerequisite that matters is not the bridge: you need the
+`muse` CLI installed with `muse login` completed in the same
+environment, or every request fails. Verify with
+`muse-bridge --selftest` before pointing clients at it.
 
 ## First run and verify
 
@@ -35,7 +58,7 @@ Expect three `PASS` lines and exit 0. If you see a `HINT` about
 bridge), then retry.
 
 ```sh
-./target/release/muse-bridge --workspace-root ~/code/my-project &
+./target/release/muse-bridge &
 curl http://127.0.0.1:17489/healthz
 curl http://127.0.0.1:17489/v1/models
 ```
@@ -47,14 +70,19 @@ server-side.
 ## Everyday running
 
 ```sh
-muse-bridge --workspace-root <dir> [--trust-workspace] [--port N]
+muse-bridge [--trust-workspace] [--port N]
 ```
 
-- `--workspace-root` is the directory the backend agent works in.
-  One bridge serves one workspace.
+- No workspace config needed: by default the bridge runs in
+  provider mode — the client owns the project/workspace, the bridge
+  sends no `workspaceRoot`, and the backend child parks in an inert
+  empty directory. Pass `--workspace-root <dir>` only when you want
+  the backend agent itself to work in a local directory.
 - `--trust-workspace` lets the backend load that workspace's skills
   and rules (`.agents/skills/`, `AGENTS.md`). Off by default. Your
   user skills (`~/.agents/skills/`) load on every turn either way.
+  In provider mode (no `--workspace-root`) there is no workspace to
+  trust, so the flag has no effect.
 - `--approval-mode` stays `denyUnmatched` unless you have a reason.
   It fails closed: actions outside policy are denied with a
   model-visible message instead of parking on a dialog.

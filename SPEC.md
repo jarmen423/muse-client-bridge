@@ -215,8 +215,9 @@ muse serve [--trust-workspace] [extra args from MUSE_SERVE_ARGS]
 ```
 
 - Binary path: `MUSE_CLI` env or `muse` on `PATH` (muse-acp
-  convention). `cwd`: bridge `--workspace-root` (default: process
-  cwd). Env: inherit (so `muse login` credentials apply).
+  convention). `cwd`: bridge `--workspace-root` when set, else a
+  bridge-managed inert dir (`<temp>/muse-bridge-no-workspace`).
+  Env: inherit (so `muse login` credentials apply).
 - Cleanup decoder ring: `stdio` NDJSON, one JSON-RPC 2.0 object per
   line, `\n`-terminated, flushed writes; tolerate `\r\n` on input;
   skip blank lines; **skip unparsable lines without dropping the
@@ -317,8 +318,10 @@ Fold rules (from the fold-model guide + `fold.rs`):
 ### 4.4 Sessions
 
 - v1: **one MSP session per HTTP request** (`session/start` with
-  `workspaceRoot` = bridge workspace, `approvalMode = denyUnmatched`
-  unless `--approval-mode` overrides). Rationale: both clients resend
+  `workspaceRoot` = bridge workspace when `--workspace-root` is set,
+  omitted in provider mode (verified live: the host adopts `null`),
+  `approvalMode = denyUnmatched` unless `--approval-mode` overrides).
+  Rationale: both clients resend
   full history per request, so the bridge stays stateless; MSP owns
   nothing across requests; no leak/GC design needed for v1.
 - Model routing: request `model` → `session/setModel {model:{modelId}}`
@@ -429,7 +432,7 @@ with an `{"error":…}` data frame. The bridge does that for chat, and
 - `cargo build --release` ⇒ single binary `muse-bridge`.
   Requires `muse` on `PATH` at RUNTIME (not build time).
 - CLI: `muse-bridge [--port 17489] [--bind 127.0.0.1]
-  [--workspace-root .] [--approval-mode denyUnmatched]
+  [--workspace-root <dir>] [--approval-mode denyUnmatched]
   [--muse-bin muse] [--trust-workspace] [--log-format json|pretty]
   [--support] [--selftest]`. `--support` prints versions,
   fingerprint pin vs live, last stderr tail; `--selftest` runs

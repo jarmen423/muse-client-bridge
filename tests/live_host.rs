@@ -31,9 +31,10 @@ impl LiveServer {
         let supervisor = Supervisor::launch(live_config())
             .await
             .expect("live launch");
+        // Provider mode: the live e2e turns prove a workspace-less bridge
+        // serves real requests (the unit + scripted suites cover the set arm).
         let dispatcher =
-            Dispatcher::new(supervisor.clone(), &std::env::temp_dir(), "denyUnmatched")
-                .expect("dispatcher");
+            Dispatcher::new(supervisor.clone(), None, "denyUnmatched").expect("dispatcher");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -78,8 +79,12 @@ async fn live_handshake_and_catalog() {
         .expect("handshake facts");
     assert_eq!(info.schema_version, Some(1));
     eprintln!("live host: {} compat={:?}", info.host_label(), info.compat);
-    let dispatcher = Dispatcher::new(supervisor.clone(), &std::env::temp_dir(), "denyUnmatched")
-        .expect("dispatcher");
+    let dispatcher = Dispatcher::new(
+        supervisor.clone(),
+        Some(&std::env::temp_dir()),
+        "denyUnmatched",
+    )
+    .expect("dispatcher");
     let catalog = dispatcher.models().await.expect("live model/list");
     assert!(!catalog.models.is_empty(), "live catalog must list models");
     eprintln!("live models: {}", catalog.models.len());
@@ -144,4 +149,34 @@ async fn live_responses_e2e() {
     assert!(!text.is_empty(), "live responses turn produced text");
     eprintln!("live responses message text: {text:?}");
     server.stop().await;
+}
+
+#[tokio::test]
+async fn live_session_start_omits_workspace_root() {
+    if !live_enabled() {
+        eprintln!("skipped: set MUSE_LIVE_TESTS=1 for live-host tests");
+        return;
+    }
+    let supervisor = Supervisor::launch(live_config())
+        .await
+        .expect("live launch");
+    let conn = supervisor.current().await;
+    let result = conn
+        .command(
+            "session/start",
+            &json!({
+                "commandId": conn.mint_command_id(),
+                "approvalMode": "denyUnmatched",
+            }),
+        )
+        .await
+        .expect("live host must accept session/start without workspaceRoot");
+    let session_id = result["session"]["sessionId"].as_str().unwrap_or("");
+    assert!(!session_id.is_empty(), "no sessionId adopted: {result}");
+    assert!(
+        result["session"]["workspaceRoot"].is_null(),
+        "host should adopt null workspaceRoot: {result}"
+    );
+    eprintln!("live no-workspace session: {session_id}");
+    supervisor.shutdown().await;
 }

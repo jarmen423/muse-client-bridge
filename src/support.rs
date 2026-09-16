@@ -108,7 +108,11 @@ pub struct SelftestStep {
 /// Prints one `PASS`/`FAIL` line per step plus a summary. Any failure (or a
 /// host that never becomes ready) exits 1. A detected no-login state adds a
 /// `muse login` hint line.
-pub async fn run_selftest(config: &HostConfig, workspace_root: &Path, approval_mode: &str) -> u8 {
+pub async fn run_selftest(
+    config: &HostConfig,
+    workspace_root: Option<&Path>,
+    approval_mode: &str,
+) -> u8 {
     let report = collect_selftest(config, workspace_root, approval_mode).await;
     let mut failed = 0;
     for step in &report.steps {
@@ -143,7 +147,7 @@ pub struct SelftestReport {
 /// Run the `--selftest` steps without printing (maintained tests drive this).
 pub async fn collect_selftest(
     config: &HostConfig,
-    workspace_root: &Path,
+    workspace_root: Option<&Path>,
     approval_mode: &str,
 ) -> SelftestReport {
     let mut steps = Vec::new();

@@ -1,6 +1,7 @@
 //! `muse-bridge` binary: CLI entry, logging, startup, graceful shutdown.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -47,14 +48,21 @@ async fn main() -> ExitCode {
     init_logging(cli.log_format);
 
     if cli.support || cli.selftest {
-        let host_config = HostConfig::from_env(cli.workspace_root.clone(), cli.trust_workspace);
+        let cwd = match host_cwd(cli.workspace_root.as_ref()) {
+            Ok(cwd) => cwd,
+            Err(Fatal { message, usage }) => {
+                eprintln!("muse-bridge: {message}");
+                return ExitCode::from(if usage { USAGE } else { FATAL });
+            }
+        };
+        let host_config = HostConfig::from_env(cwd, cli.trust_workspace);
         if cli.support {
             muse_bridge::support::run_support(&host_config).await;
         }
         if cli.selftest {
             let code = muse_bridge::support::run_selftest(
                 &host_config,
-                &cli.workspace_root,
+                cli.workspace_root.as_deref(),
                 &cli.approval_mode,
             )
             .await;
@@ -75,6 +83,24 @@ async fn main() -> ExitCode {
 struct Fatal {
     message: String,
     usage: bool,
+}
+
+/// Host child cwd: the workspace when set, else a bridge-managed inert
+/// directory (provider mode parks the child outside the operator's cwd).
+fn host_cwd(workspace_root: Option<&PathBuf>) -> Result<PathBuf, Fatal> {
+    match workspace_root {
+        Some(root) => Ok(root.clone()),
+        None => {
+            let dir = std::env::temp_dir().join("muse-bridge-no-workspace");
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                Fatal::runtime(format!(
+                    "cannot create inert host dir {}: {e}",
+                    dir.display()
+                ))
+            })?;
+            Ok(dir)
+        }
+    }
 }
 
 impl Fatal {
@@ -108,12 +134,22 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
         tracing::warn!(bind = %addr, "bound to a non-loopback address with --allow-remote; ensure a trusted boundary");
     }
 
-    let host_config = HostConfig::from_env(cli.workspace_root.clone(), cli.trust_workspace);
+    if cli.workspace_root.is_none() {
+        tracing::info!(
+            "no --workspace-root: provider mode (the client owns the workspace; no workspaceRoot is sent)"
+        );
+    }
+    let host_config =
+        HostConfig::from_env(host_cwd(cli.workspace_root.as_ref())?, cli.trust_workspace);
     let supervisor = Supervisor::launch(host_config)
         .await
         .map_err(|e| Fatal::runtime(e.to_string()))?;
-    let dispatcher = Dispatcher::new(supervisor.clone(), &cli.workspace_root, &cli.approval_mode)
-        .map_err(Fatal::runtime)?;
+    let dispatcher = Dispatcher::new(
+        supervisor.clone(),
+        cli.workspace_root.as_deref(),
+        &cli.approval_mode,
+    )
+    .map_err(Fatal::runtime)?;
     if let Some(info) = supervisor.current().await.handshake_info() {
         tracing::info!(
             host = %info.host_label(),
