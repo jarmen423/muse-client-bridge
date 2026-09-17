@@ -656,7 +656,20 @@ async fn acp_session_list_merges_owned_and_host() {
         .expect("host-only sessions surface under their MSP id");
     assert_eq!(foreign["cwd"], json!("/tmp/fake-ws"));
     assert_eq!(foreign["updatedAt"], json!("2026-09-15T00:00:00Z"));
-    assert_eq!(foreign["title"], json!("fake session"));
+    assert_eq!(
+        foreign["title"],
+        json!("Derived Title"),
+        "nameless rows fall back to the derived title: {sessions:?}"
+    );
+    let prompt_only = sessions
+        .iter()
+        .find(|s| s["sessionId"] == json!("fake-sess-prompt-only"))
+        .expect("prompt-only rows surface");
+    assert_eq!(
+        prompt_only["title"],
+        json!(format!("{}…", "p".repeat(80))),
+        "title-less rows fall back to the capped prompt preview: {sessions:?}"
+    );
     client.shutdown().await;
 }
 
@@ -3296,6 +3309,11 @@ async fn acp_subagent_verbs_execute_and_report() {
     assert!(
         card.contains("Explore the schema") && card.contains("Write the migration"),
         "retention lands: {card}"
+    );
+    // The card teaches its own verbs (the palette entry cannot).
+    assert!(
+        card.contains("Verbs: stop, interrupt, close, resume, reopen"),
+        "card lists verbs: {card}"
     );
     let log_text = || std::fs::read_to_string(&log).unwrap_or_default();
 

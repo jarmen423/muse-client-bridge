@@ -896,7 +896,9 @@ impl SessionStore {
         render_tasks_card(&todos)
     }
 
-    /// `/subagents`: retained model-spawned subagents, read-only.
+    /// `/subagents`: retained model-spawned subagents, read-only. The
+    /// card always closes with the verb list — the palette entry can't
+    /// name them all, and undiscoverable verbs are dead verbs.
     async fn subagents_card(&self, acp_sid: &str) -> String {
         let children = {
             let inner = self.inner.lock().await;
@@ -905,12 +907,17 @@ impl SessionStore {
                 None => return "Subagents unavailable: unknown session.".to_string(),
             }
         };
-        render_children_card(
+        let mut card = render_children_card(
             "Subagents",
             "subagent",
             &children,
             "No subagents observed yet this session.",
-        )
+        );
+        card.push_str(
+            "\nVerbs: stop, interrupt, close, resume, reopen, message <text>, followup <text>, \
+             result — `/subagents <verb> [target]`, or pick from the selector.\n",
+        );
+        card
     }
 
     /// Pick one retained child via elicitation over `options` (all
@@ -1709,7 +1716,7 @@ impl SessionStore {
         }
         // Host metadata enriches owned rows (last activity) and supplies
         // importable foreign rows (past TUI/CLI sessions).
-        let mut host_meta: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+        let mut host_meta: std::collections::HashMap<String, HostRowMeta> =
             std::collections::HashMap::new();
         let mut host_items: Vec<Value> = Vec::new();
         match conn.command_with_retry("session/list", &list_params).await {
@@ -1720,17 +1727,13 @@ impl SessionStore {
                         if msp_id.is_empty() {
                             continue;
                         }
-                        let name = item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .filter(|n| !n.is_empty())
-                            .map(str::to_string);
-                        let updated = item
-                            .get("updatedAt")
-                            .and_then(Value::as_str)
-                            .filter(|u| !u.is_empty())
-                            .map(str::to_string);
-                        host_meta.insert(msp_id.to_string(), (name, updated));
+                        let meta = HostRowMeta {
+                            name: host_string(item, "name"),
+                            title: host_string(item, "title"),
+                            prompt: host_string(item, "firstUserPrompt"),
+                            updated: host_string(item, "updatedAt"),
+                        };
+                        host_meta.insert(msp_id.to_string(), meta);
                         host_items.push(item.clone());
                     }
                 }
@@ -1753,14 +1756,20 @@ impl SessionStore {
                     "cwd": cwd,
                     "_meta": {"mspSessionId": msp},
                 });
-                // Title: folded name first, host name second; updatedAt from
-                // the host row. Absent fields stay absent (never blank).
-                let (host_name, host_updated) =
-                    host_meta.get(msp.as_str()).cloned().unwrap_or((None, None));
-                if let Some(title) = name.clone().filter(|n| !n.is_empty()).or(host_name) {
+                // Title: folded name, host name, derived host title, then
+                // the first-prompt preview (capped — it can be long);
+                // updatedAt from the host row. Absent fields stay absent.
+                let meta = host_meta.get(msp.as_str()).cloned().unwrap_or_default();
+                if let Some(title) = name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .or(meta.name)
+                    .or(meta.title)
+                    .or_else(|| meta.prompt.map(|p| truncate(&p, 80)))
+                {
                     entry["title"] = Value::String(title);
                 }
-                if let Some(updated) = host_updated {
+                if let Some(updated) = meta.updated {
                     entry["updatedAt"] = Value::String(updated);
                 }
                 entry
@@ -1786,12 +1795,11 @@ impl SessionStore {
                 continue;
             };
             let mut entry = json!({"sessionId": msp_id, "cwd": root});
-            if let Some(title) = item
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|n| !n.is_empty())
+            if let Some(title) = host_string(item, "name")
+                .or_else(|| host_string(item, "title"))
+                .or_else(|| host_string(item, "firstUserPrompt").map(|p| truncate(&p, 80)))
             {
-                entry["title"] = Value::String(title.to_string());
+                entry["title"] = Value::String(title);
             }
             if let Some(updated) = item
                 .get("updatedAt")
@@ -5063,6 +5071,28 @@ fn reject_additional_dirs(params: &Value) -> Result<(), AcpError> {
         ));
     }
     Ok(())
+}
+
+/// Display metadata kept per host `session/list` row (titles + activity
+/// for owned rows; the full foreign entry otherwise).
+#[derive(Clone, Default)]
+struct HostRowMeta {
+    /// Durable session name.
+    name: Option<String>,
+    /// Derived display title.
+    title: Option<String>,
+    /// First-user-prompt preview (title fallback, capped at render).
+    prompt: Option<String>,
+    /// Last activity (RFC3339 verbatim).
+    updated: Option<String>,
+}
+
+/// Non-blank string field of a host row (`None` when missing/blank/null).
+fn host_string(item: &Value, key: &str) -> Option<String> {
+    item.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
 }
 
 /// Deduplicated display labels for an elicitation select, positionally

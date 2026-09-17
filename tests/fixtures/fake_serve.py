@@ -341,7 +341,18 @@ def answer(method, req_id, params):
         host_only = dict(session_obj())
         host_only["sessionId"] = "fake-sess-host-only"
         host_only["updatedAt"] = "2026-09-15T00:00:00Z"
-        return {"result": {"sessions": [listed, host_only]}}
+        # Nameless rows exercise the title fallbacks (derived title, then
+        # the capped first-prompt preview).
+        host_only["name"] = ""
+        host_only["title"] = "Derived Title"
+        host_only["firstUserPrompt"] = "first words here"
+        host_prompt_only = dict(session_obj())
+        host_prompt_only["sessionId"] = "fake-sess-prompt-only"
+        host_prompt_only["updatedAt"] = "2026-09-15T00:00:00Z"
+        host_prompt_only["workspaceRoot"] = "/tmp/fake-ws-2"
+        host_prompt_only["name"] = ""
+        host_prompt_only["firstUserPrompt"] = "p" * 100
+        return {"result": {"sessions": [listed, host_only, host_prompt_only]}}
     if method == "session/read":
         return {"result": {
             "session": session_obj(),
