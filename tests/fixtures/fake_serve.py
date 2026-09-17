@@ -13,7 +13,7 @@ stay parallel-safe):
                   | turn-userinput | turn-userinput-form | turn-gap | turn-failed | turn-tool-slow
                   | turn-tool | turn-reasoning | turn-reasoning-quiet
                   | turn-unqueued | turn-retracted | turn-retract-then-completed
-                  | turn-retry-then-completed | turn-queued
+                  | turn-retry-then-completed | turn-queued | turn-children
   FAKE_LOG        file recording received "METHOD cmd=<commandId|-> ..." lines
                   (key methods append assertion details; client responses to
                   server requests log as "<response> id=<id> result|error")
@@ -113,7 +113,8 @@ if TURN_SCRIPT not in (None, "turn-happy", "turn-approval", "turn-approval-all-a
                        "turn-failed", "turn-tool-slow", "turn-tool",
                        "turn-reasoning", "turn-reasoning-quiet", "turn-unqueued",
                        "turn-retracted", "turn-retract-then-completed",
-                       "turn-retry-then-completed", "turn-queued"):
+                       "turn-retry-then-completed", "turn-queued",
+                       "turn-children"):
     sys.stderr.write(f"fake_serve: unknown turn script {TURN_SCRIPT!r}\n")
     sys.exit(2)
 for rule in os.environ.get("FAKE_OVERLOADED", "").split(","):
@@ -176,6 +177,8 @@ def log_method(method, params):
         detail = f" expected={params.get('expectedTurnId', '-')}"
     elif method == "turn/unqueue":
         detail = f" turn={params.get('turnId', '-')}"
+    elif method.startswith("subagent/"):
+        detail = f" sub={params.get('subagentId', '-')}"
     elif method == "view/page":
         detail = f" cursor={params.get('cursor', '<genesis>')}"
     with open(LOG, "a") as f:
@@ -233,6 +236,7 @@ def session_obj():
         "createdAt": "2026-09-14T00:00:00Z",
         "forkedFrom": None,
         "modelId": "fake-model",
+        "name": "fake session",
         "path": "/tmp/fake-session.jsonl" if DURABILITY != "ephemeral" else "",
         "providerId": "fake",
         "sessionId": MSP_SID,
@@ -408,6 +412,14 @@ def answer(method, req_id, params):
                 "commandId": params.get("commandId", ""),
                 "status": "accepted",
                 "turnId": params.get("turnId", ""),
+            }
+        }
+    if method.startswith("subagent/"):
+        # All eight control methods ack admission-only (CommandAccepted).
+        return {
+            "result": {
+                "commandId": params.get("commandId", ""),
+                "status": "accepted",
             }
         }
     if method == "approval/decide":
@@ -651,6 +663,59 @@ def play_script(turn_id):
                 emit_usage(held)
                 complete_turn(held, "completed")
             QUEUED.clear()
+    elif TURN_SCRIPT == "turn-children":
+        notify("turn/started", {"turnId": turn_id})
+        notify("item/started", {"item": {
+            "itemId": "child-1", "kind": "subagent", "turnId": turn_id,
+            "revision": 1, "objective": "Explore the schema",
+            "controlStatus": "starting", "subagentId": "sa-1", "depth": 1,
+        }})
+        notify("item/updated", {"item": {
+            "itemId": "child-1", "kind": "subagent", "turnId": turn_id,
+            "revision": 2, "status": "inProgress",
+            "objective": "Explore the schema",
+            "controlStatus": "running", "subagentId": "sa-1", "depth": 1,
+        }})
+        notify("item/started", {"item": {
+            "itemId": "wf-1", "kind": "workflow", "turnId": turn_id,
+            "revision": 1, "scriptId": "research", "entryId": "entry-1",
+            "triggerSource": "modelProposal", "children": [],
+        }})
+        notify("item/completed", {"item": {
+            "itemId": "child-1", "kind": "subagent", "turnId": turn_id,
+            "revision": 3, "status": "completed",
+            "objective": "Explore the schema",
+            "controlStatus": "closed", "subagentId": "sa-1", "depth": 1,
+            "durationMs": 1500,
+            "result": {"summary": "schema mapped", "text": "tables: users, orders",
+                       "artifactRefs": [], "evidenceRefs": []},
+        }})
+        notify("item/started", {"item": {
+            "itemId": "child-2", "kind": "subagent", "turnId": turn_id,
+            "revision": 1, "objective": "Write the migration",
+            "controlStatus": "starting", "subagentId": "sa-2", "depth": 1,
+        }})
+        notify("item/updated", {"item": {
+            "itemId": "child-2", "kind": "subagent", "turnId": turn_id,
+            "revision": 2, "status": "inProgress",
+            "objective": "Write the migration",
+            "controlStatus": "running", "subagentId": "sa-2", "depth": 1,
+        }})
+        notify("item/completed", {"item": {
+            "itemId": "wf-1", "kind": "workflow", "turnId": turn_id,
+            "revision": 2, "status": "completed", "scriptId": "research",
+            "entryId": "entry-1", "triggerSource": "modelProposal",
+            "message": "two findings",
+            "children": [
+                {"childId": "a", "attempt": 1, "status": "succeeded",
+                 "label": "search", "terminal": "completed"},
+                {"childId": "b", "attempt": 1, "status": "succeeded",
+                 "label": "read", "terminal": "completed"},
+            ],
+        }})
+        notify("item/completed", {"item": agent_item("m1", turn_id, 1, "completed", "done")})
+        emit_usage(turn_id)
+        complete_turn(turn_id, "completed")
 
 
 def sendApproval(turn_id, all_approve, approval_id="ap-1"):

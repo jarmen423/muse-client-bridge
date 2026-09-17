@@ -348,7 +348,19 @@ async fn handle_request(
         "session/new" => {
             let ver = *version.lock().await;
             match store.create_session(ver, params).await {
-                Ok(result) => send(outbound, result_frame(id, result)).await,
+                Ok(result) => {
+                    let sid = result
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    send(outbound, result_frame(id, result)).await;
+                    // Commands advertise after the result: the client only
+                    // routes updates once the response arrives.
+                    if !sid.is_empty() {
+                        store.advertise_commands(&sid).await;
+                    }
+                }
                 Err(error) => send(outbound, error_frame(id, error.code, &error.message)).await,
             }
         }
@@ -359,14 +371,38 @@ async fn handle_request(
         "session/resume" | "session/load" => {
             let ver = *version.lock().await;
             match store.resume_or_load(method, ver, params).await {
-                Ok(result) => send(outbound, result_frame(id, result)).await,
+                Ok(result) => {
+                    let sid = result
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    send(outbound, result_frame(id, result)).await;
+                    // Commands advertise after the result (history replay
+                    // already streamed before it, per spec).
+                    if !sid.is_empty() {
+                        store.advertise_commands(&sid).await;
+                    }
+                }
                 Err(error) => send(outbound, error_frame(id, error.code, &error.message)).await,
             }
         }
         "session/fork" => {
             let ver = *version.lock().await;
             match store.fork(ver, params).await {
-                Ok(result) => send(outbound, result_frame(id, result)).await,
+                Ok(result) => {
+                    let sid = result
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    send(outbound, result_frame(id, result)).await;
+                    // Commands advertise after the result: the client only
+                    // routes updates once the response arrives.
+                    if !sid.is_empty() {
+                        store.advertise_commands(&sid).await;
+                    }
+                }
                 Err(error) => send(outbound, error_frame(id, error.code, &error.message)).await,
             }
         }

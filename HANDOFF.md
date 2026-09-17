@@ -18,18 +18,28 @@ the next.
 3. [PRD.md](/home/josh/code/muse-client-bridge/PRD.md) — original goals (context only).
 4. `.cache/reference/README.md` — what's cached where.
 
-## Current state (refreshed 2026-09-17, wire-real follow-ups landed)
+## Current state (refreshed 2026-09-17, yolo + import + selectors)
 
 - **ACP parity:** dynamic skill slash commands (`muse skills list
   --json` per session workspace, `/<id>` → `/skill <id>`); protocol
   commands `/help` `/status` `/usage` `/name` `/models` `/exit`
-  `/effort` `/recap` `/stop` `/goal` `/tasks` settle inline (never
+  `/effort` `/recap` `/stop` `/goal` `/tasks` `/subagents`
+  `/workflows` settle inline (never
   `turn/start`); approvals bridge via `session/request_permission`;
   user input via `elicitation/create` (gated on the client's
   `elicitation.form` capability). Per-session observers fold MSP
   events into facts + ACP updates and resubscribe across host
   restarts. `session/new` `mcpServers` forward into
   `session/start`'s `config.mcpServers` (warn-and-skip per entry).
+  Sessions advertise `configOptions` (mode/model/effort pickers)
+  plus v1 `modes` for ModeSelector-path clients, and
+  `available_commands_update` trails the result frame (Zed drops
+  pre-result updates). Modes are ask/auto/yolo/deny — yolo rides
+  host `allowAll` and auto-declines user questions (never
+  auto-approves host approvals). Bare `/models` and `/effort`
+  offer elicitation select forms when the client has a surface,
+  else cards. `session/list` carries titles + activity for Zed's
+  importer; every entry loads with history replay.
   New surface: `src/acp/skills.rs`, `ClientRequests` in `server.rs`,
   observer + dialog state machines in `sessions.rs`.
 - **Spike resolved:** the remaining "genuine gaps" are mostly
@@ -38,9 +48,18 @@ the next.
   (findings in TODO.md). The wire-real follow-ups all landed
   (`mcpServers` forwarding, `/stop`, `/goal`, `/tasks`); the
   status/recap goal line now reads `Goal.objective`. `/workflows`
-  `/subagents` deferred: no MSP list method, no ACP shape.
-- **Gates:** `cargo test` (214 tests), `clippy -D warnings`,
-  `fmt --check`, `cargo build --release` all clean.
+  `/subagents` display landed too — the earlier "no list method"
+  verdict was wrong: the view stream IS the list (`subagent` /
+  `workflow` items), so the observer retains them session-wide,
+  streams each as its own `tool_call` block, and the cards +
+  history replay read the retention. All eight `subagent/*`
+  control verbs landed as well (`/subagents <verb> [target]
+  [text]`, elicitation selectors for targets + bodies; the
+  durable `subagentId` is retained for control, results render
+  from retention and consume only when absent). Still future:
+  `/deep-research` (no workflow-launch method).
+- **Gates:** `cargo test` (314 tests), `clippy -D warnings`,
+  `fmt --check`, `MUSE_LIVE_TESTS=1 cargo test` all clean.
 
 ### Earlier state (FORK_PLAN P6)
 

@@ -113,6 +113,8 @@ modify it (re-fetch instead). Layout + provenance:
 | `hermes-docs/` | 459 doc pages | `hermes-agent.nousresearch.com` sitemap |
 | `codex/` | openai/codex source (client+config evidence) | `github.com/openai/codex` @ fetch date |
 | `muse-acp/` | Rust ACP→MSP adapter + 50 transcripts | `github.com/BrokkAi/muse-acp` |
+| `acp-protocol/` | ACP JSON schemas v1+v2 (+changelogs) | `agentclientprotocol/agent-client-protocol` @ 2026-09-17 |
+| `zed/v1.19.2/` | Zed ACP client evidence (routing, pickers) | `zed-industries/zed` @ v1.19.2 |
 
 Known drift: the SDK mirror LAGS the local binary (local adds
 `item/readOutput`, `session/rename`, `session/setReasoningEffort`,

@@ -9,7 +9,8 @@
 //!
 //! Implemented here: new/list/resume/load/fork/close, prompt (incl. the
 //! protocol commands `/compact` `/help` `/status` `/usage` `/name` `/model`
-//! `/exit` `/effort` `/recap` `/stop` `/goal` `/tasks`), steering,
+//! `/exit` `/effort` `/recap` `/stop` `/goal` `/tasks` `/subagents`
+//! `/workflows`), steering,
 //! mode/model/effort selectors, gap
 //! page+refold with lag catch-up, permission dialogs
 //! (`session/request_permission`), user questions (`elicitation/create`
@@ -43,7 +44,7 @@ pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 /// nothing auto-approves under this default.
 pub const DEFAULT_APPROVAL_MODE: &str = "promptUnmatched";
 /// Env override for the session approval mode (`MUSE_APPROVAL_MODE`, either
-/// vocabulary: `ask|auto|deny` or a host mode). Invalid values fail
+/// vocabulary: `ask|auto|yolo|deny` or a host mode). Invalid values fail
 /// `session/new` loudly instead of falling back.
 pub const APPROVAL_MODE_ENV: &str = "MUSE_APPROVAL_MODE";
 /// Cap for inlining local `resource_link` file text into a prompt (1 MiB;
@@ -56,6 +57,9 @@ const USER_INPUT_CANCEL_REASON: &str = "acp-fail-closed";
 const ELICITATION_DISMISSED_REASON: &str = "acp-elicitation-dismissed";
 /// `userInput/cancel` reason when the elicitation reply errored out.
 const ELICITATION_FAILED_REASON: &str = "acp-elicitation-failed";
+/// `userInput/cancel` reason in yolo mode (the user opted out of
+/// questions; the host decides how to proceed without answers).
+const YOLO_NO_QUESTIONS_REASON: &str = "acp-yolo-no-questions";
 
 /// One in-flight ACP prompt: the MSP turn plus its reply routing.
 struct InFlight {
@@ -134,6 +138,35 @@ struct SessionFacts {
     usage_pressure: Option<String>,
 }
 
+/// One observed model-spawned child (a `subagent` run or `workflow`
+/// launch), folded from view items by the session observer. Retention is
+/// session-scoped — children outlive the turns that spawned them, and the
+/// observer (not the per-turn fold) owns it, so completions that land
+/// while idle are kept too. Feeds the `/subagents` and `/workflows` cards
+/// plus the live `tool_call` frames.
+#[derive(Clone)]
+struct ChildRecord {
+    /// The view item kind, verbatim (`subagent` or `workflow`).
+    kind: String,
+    /// Display title (objective / script identity / fallback).
+    title: String,
+    /// MSP item `status` verbatim (`""` until the first status lands).
+    status: String,
+    /// Second line: control/child state plus the terminal message.
+    detail: String,
+    /// Highest folded `revision` (replace-iff-higher, like the turn fold).
+    rev: u64,
+    /// A terminal status (or `item/completed`) has been folded.
+    terminal: bool,
+    /// The item's durable `subagentId` (`""` when the host never sent
+    /// one): the control target for the `subagent/*` verbs.
+    subagent_id: String,
+    /// The retained `result` envelope summary (`subagent` only).
+    result_summary: String,
+    /// The retained `result` envelope text (`subagent` only).
+    result_text: String,
+}
+
 /// One ACP session: a persistent MSP session plus prompt state.
 struct AcpSession {
     /// Server-minted MSP session id.
@@ -142,7 +175,7 @@ struct AcpSession {
     cwd: String,
     /// Negotiated ACP protocol version (1 or 2: chunk/message shapes).
     ver: u8,
-    /// Effective MSP approval mode, in our vocabulary (`ask|auto|deny`).
+    /// Effective MSP approval mode, in our vocabulary (`ask|auto|yolo|deny`).
     mode: String,
     /// Last selected model id (`""` ⇒ server default).
     model_value: String,
@@ -169,6 +202,8 @@ struct AcpSession {
     ui_seen: HashSet<String>,
     /// Folded session facts (name/goal/branch/todos/usage).
     facts: SessionFacts,
+    /// Observed subagent/workflow children by view `itemId`.
+    children: HashMap<String, ChildRecord>,
 }
 
 struct StoreInner {
@@ -241,7 +276,7 @@ impl SessionStore {
                 AcpError::invalid_params(format!("session/new cwd is unusable ({cwd}): {e}"))
             })?)
         };
-        let approval_mode = resolve_startup_mode()?;
+        let (approval_mode, startup_label) = resolve_startup_mode()?;
 
         let conn = self.ready_conn().await?;
         let mut start_params = start_params(&conn, &approval_mode, workspace_root.as_deref());
@@ -309,7 +344,13 @@ impl SessionStore {
             .await;
 
         let acp_sid = format!("acp-{}", uuid::Uuid::new_v4().simple());
-        let mode_vocab = mode_from_msp(&mode).to_string();
+        // Yolo survives only when the host actually folded allowAll; a
+        // downgraded echo falls back to the folded label, loudly (above).
+        let mode_vocab = if startup_label == "yolo" && mode == "allowAll" {
+            "yolo".to_string()
+        } else {
+            mode_from_msp(&mode).to_string()
+        };
         let active_turn = start
             .get("session")
             .and_then(|s| s.get("activeTurnId"))
@@ -341,11 +382,16 @@ impl SessionStore {
                         branch: session.get("branch").map(|b| json!({"branch": b.clone()})),
                         ..SessionFacts::default()
                     },
+                    children: HashMap::new(),
                 },
             );
         }
         self.spawn_observer(&acp_sid);
         tracing::info!(acp_sid, msp_sid, mode, "acp session created");
+        // Selectors ride `configOptions` (Zed negotiates v1 and renders
+        // one button per option); `modes` rides along on v1 for clients
+        // on the ModeSelector path (Zed itself prefers configOptions and
+        // ignores it — verified against Zed 1.19.2 `config_state`).
         let mut result = json!({
             "sessionId": acp_sid,
             "_meta": {"mspSessionId": msp_sid},
@@ -354,13 +400,31 @@ impl SessionStore {
         if ver != 2 {
             result["modes"] = session_modes(&mode_vocab);
         }
-        // Advertise slash commands like `muse-acp` (best effort: a closed
-        // channel means the writer is gone and the process is exiting).
+        // Slash-command advertisement goes out after the result frame (see
+        // `advertise_commands`): the client only routes `session/update`
+        // once the response arrives.
+        Ok(result)
+    }
+
+    /// Advertise slash commands for a session AFTER its result frame is on
+    /// the wire. Zed registers update routing only once the `session/new`
+    /// (or resume/load/fork) response arrives, so an update sent before
+    /// the result is dropped and `/` stays empty (verified against Zed
+    /// 1.19.2 `agent_servers`; both references send result first).
+    /// Best effort: a closed channel means the writer is gone and the
+    /// process is exiting.
+    pub async fn advertise_commands(&self, acp_sid: &str) {
+        let (ver, skills) = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => (s.ver, s.skills.clone()),
+                None => return,
+            }
+        };
         let _ = self
             .outbound
-            .send(available_commands_frame(&acp_sid, ver, &skills))
+            .send(available_commands_frame(acp_sid, ver, &skills))
             .await;
-        Ok(result)
     }
 
     /// `session/prompt`: submit one turn and stream it. Admission errors
@@ -535,6 +599,8 @@ impl SessionStore {
             ProtocolCommand::Stop => self.run_stop(acp_sid).await,
             ProtocolCommand::Goal => self.goal_card(acp_sid).await,
             ProtocolCommand::Tasks => self.tasks_card(acp_sid).await,
+            ProtocolCommand::Subagents => self.run_subagents(acp_sid, msp_sid, arg).await?,
+            ProtocolCommand::Workflows => self.run_workflows(acp_sid, arg).await,
         };
         self.settle_command(acp_sid, ver, req_id, &echo_text, &card)
             .await;
@@ -830,6 +896,242 @@ impl SessionStore {
         render_tasks_card(&todos)
     }
 
+    /// `/subagents`: retained model-spawned subagents, read-only.
+    async fn subagents_card(&self, acp_sid: &str) -> String {
+        let children = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => s.children.clone(),
+                None => return "Subagents unavailable: unknown session.".to_string(),
+            }
+        };
+        render_children_card(
+            "Subagents",
+            "subagent",
+            &children,
+            "No subagents observed yet this session.",
+        )
+    }
+
+    /// Pick one retained child via elicitation over `options` (all
+    /// subagents, or an ambiguous subset). Returns the picked item id
+    /// plus the body: the args text when given, else the form's text
+    /// field when the verb needs one. `None` on no-surface/dismiss.
+    async fn pick_subagent(
+        &self,
+        acp_sid: &str,
+        verb: &SubagentVerb,
+        options: &[(String, String)],
+        body_arg: &str,
+    ) -> Option<(String, String)> {
+        let message = format!("Select a subagent to {}", verb.name);
+        if verb.needs_body && body_arg.is_empty() {
+            self.elicit_select_with_text(acp_sid, &message, options, "text")
+                .await
+        } else {
+            let id = self.elicit_choice(acp_sid, &message, options).await?;
+            Some((id, body_arg.to_string()))
+        }
+    }
+
+    /// `/subagents [verb] [target] [text]`: bare lists the retained
+    /// children; otherwise resolve the target (picker fallback when the
+    /// client has a form surface) and run one control verb. User errors
+    /// (unknown verb/target, missing body) return cards; host failures
+    /// propagate like the other mutating commands. Every verb reports
+    /// admission — the outcome lands in the child's block (even
+    /// `result`, whose content rides the view stream).
+    async fn run_subagents(
+        &self,
+        acp_sid: &str,
+        msp_sid: &str,
+        arg: &str,
+    ) -> Result<String, AcpError> {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return Ok(self.subagents_card(acp_sid).await);
+        }
+        let (verb_word, rest) = match arg.split_once(char::is_whitespace) {
+            Some((v, r)) => (v, r.trim()),
+            None => (arg, ""),
+        };
+        let Some(verb) = parse_subagent_verb(verb_word) else {
+            return Ok(subagents_usage());
+        };
+        let children = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => s.children.clone(),
+                None => return Ok("Subagents unavailable: unknown session.".to_string()),
+            }
+        };
+        if !children.values().any(|c| c.kind == "subagent") {
+            return Ok(self.subagents_card(acp_sid).await);
+        }
+        let (target_word, body_arg) = match rest.split_once(char::is_whitespace) {
+            Some((t, b)) => (t, b.trim()),
+            None => (rest, ""),
+        };
+        // Resolve the target: the picker covers nothing-typed and
+        // ambiguity; a specific miss stays an error card (never a guess,
+        // and never dropping typed body text into a picker).
+        let subagent_rows: Vec<(&str, &ChildRecord)> = children
+            .iter()
+            .filter(|(_, c)| c.kind == "subagent")
+            .map(|(id, c)| (id.as_str(), c))
+            .collect();
+        let (item_id, body) = if target_word.is_empty() {
+            let options = subagent_options(&subagent_rows);
+            match self.pick_subagent(acp_sid, verb, &options, body_arg).await {
+                Some(picked) => picked,
+                None => {
+                    let mut card = self.subagents_card(acp_sid).await;
+                    card.push_str(&format!(
+                        "\nPick a target: `/subagents {} <id>`.",
+                        verb.name
+                    ));
+                    return Ok(card);
+                }
+            }
+        } else {
+            match resolve_subagent_target(&children, target_word) {
+                ChildTarget::One(id) => (id, body_arg.to_string()),
+                ChildTarget::None => {
+                    return Ok(format!(
+                        "No subagent matches '{target_word}'.\n\n{}",
+                        self.subagents_card(acp_sid).await
+                    ));
+                }
+                ChildTarget::WorkflowOnly => {
+                    return Ok(format!(
+                        "'{target_word}' matches a workflow run — workflows have no control \
+                         methods (MSP exposes none), so verbs are subagent-only."
+                    ));
+                }
+                ChildTarget::Many(cands) => {
+                    let rows: Vec<(&str, &ChildRecord)> =
+                        cands.iter().map(|(id, c)| (id.as_str(), c)).collect();
+                    let options = subagent_options(&rows);
+                    match self.pick_subagent(acp_sid, verb, &options, body_arg).await {
+                        Some(picked) => picked,
+                        None => {
+                            let titles: Vec<String> = cands
+                                .iter()
+                                .map(|(_, c)| format!("- {}", c.title))
+                                .collect();
+                            return Ok(format!(
+                                "'{target_word}' matches several subagents — be more specific:\n{}",
+                                titles.join("\n")
+                            ));
+                        }
+                    }
+                }
+            }
+        };
+        // Re-read retention: the picker round-trip may have folded fresher
+        // state (notably a result that landed while choosing).
+        let record = {
+            let inner = self.inner.lock().await;
+            match inner
+                .sessions
+                .get(acp_sid)
+                .and_then(|s| s.children.get(&item_id))
+            {
+                Some(record) => record.clone(),
+                None => return Ok(self.subagents_card(acp_sid).await),
+            }
+        };
+        // `result` renders retained truth; consume (`readResult` is
+        // state-changing) only when nothing is kept.
+        if verb.method == "subagent/readResult"
+            && (!record.result_summary.is_empty() || !record.result_text.is_empty())
+        {
+            return Ok(render_result_card(&record.title, &record));
+        }
+        // A missing body gets one text prompt when the client has a
+        // form surface; otherwise (or on empty/dismissed) usage — never
+        // a host round-trip the server would reject.
+        let mut body = body.trim().to_string();
+        if verb.needs_body && body.is_empty() {
+            let prompt = format!("Message text for '{}' ({})", record.title, verb.name);
+            match self.elicit_text(acp_sid, &prompt, "text").await {
+                Some(text) if !text.trim().is_empty() => {
+                    body = text.trim().to_string();
+                }
+                _ => {
+                    return Ok(format!(
+                        "`/subagents {} <target> <text>` needs message text.\n",
+                        verb.name
+                    ));
+                }
+            }
+        }
+        if record.subagent_id.is_empty() {
+            return Ok(format!(
+                "'{}' has no durable subagent id — the host never reported one, so it cannot \
+                 be controlled.",
+                record.title
+            ));
+        }
+        let conn = self.ready_conn().await?;
+        let mut params = json!({
+            "commandId": conn.mint_command_id(),
+            "sessionId": msp_sid,
+            "subagentId": record.subagent_id,
+        });
+        if verb.needs_body {
+            params["body"] = Value::String(body);
+        } else if verb.takes_reason {
+            params["reason"] = Value::String(format!(
+                "/subagents {} '{}'",
+                verb.name,
+                truncate(&record.title, 80)
+            ));
+        }
+        let ack = conn
+            .command_with_retry(verb.method, &params)
+            .await
+            .map_err(|e| AcpError::msp_command(verb.method, &e))?;
+        let status = ack
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("accepted");
+        Ok(format!(
+            "{} for '{}' ({status}) — the outcome lands in its block.",
+            verb.ack, record.title
+        ))
+    }
+
+    /// `/workflows`: retained workflow runs, read-only.
+    async fn workflows_card(&self, acp_sid: &str) -> String {
+        let children = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => s.children.clone(),
+                None => return "Workflows unavailable: unknown session.".to_string(),
+            }
+        };
+        render_children_card(
+            "Workflows",
+            "workflow",
+            &children,
+            "No workflow runs observed yet this session.",
+        )
+    }
+
+    /// `/workflows [anything]`: the card; arguments are refused loudly —
+    /// runs are display-only (MSP exposes no workflow methods).
+    async fn run_workflows(&self, acp_sid: &str, arg: &str) -> String {
+        let mut card = self.workflows_card(acp_sid).await;
+        if !arg.trim().is_empty() {
+            card.push_str(
+                "\nWorkflow runs take no arguments — they are display-only (MSP exposes no \
+                 workflow control methods).\n",
+            );
+        }
+        card
+    }
+
     /// `/name [name]`: `session/rename` on an argument, or the current name.
     async fn run_name(&self, acp_sid: &str, msp_sid: &str, arg: &str) -> Result<String, AcpError> {
         if arg.is_empty() {
@@ -868,6 +1170,141 @@ impl SessionStore {
         Ok(format!("Session renamed to {settled}."))
     }
 
+    /// Send one `elicitation/create` form and await the accepted
+    /// `content` object. `None` when the client has no form surface, the
+    /// request errors, or the user declines/dismisses/cancels — callers
+    /// fall back to their card. Shared mechanics for the command
+    /// pickers; commands run on spawned handler tasks, so awaiting the
+    /// reply cannot wedge the read loop (no turn runs, so no state
+    /// updates are sent).
+    async fn elicit_form_raw(
+        &self,
+        acp_sid: &str,
+        message: &str,
+        properties: Value,
+        required: &[&str],
+    ) -> Option<Value> {
+        if !self.elicitation_form.load(Ordering::SeqCst) {
+            return None;
+        }
+        let params = json!({
+            "sessionId": acp_sid,
+            "mode": "form",
+            "message": message,
+            "requestedSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        });
+        let (_req_id, rx) = self
+            .client
+            .request("elic", params, "elicitation/create")
+            .await;
+        let reply = rx.await.ok()?;
+        if reply.get("error").is_some() {
+            return None;
+        }
+        let accepted = reply
+            .get("result")
+            .and_then(|r| r.get("action"))
+            .and_then(Value::as_str)
+            == Some("accept");
+        if !accepted {
+            tracing::info!(
+                acp_sid,
+                "command elicitation dismissed; falling back to the card"
+            );
+            return None;
+        }
+        reply.get("result").and_then(|r| r.get("content")).cloned()
+    }
+
+    /// Offer the client a single-select elicitation form and await the
+    /// choice. `options` are (value, label) pairs; the form shows labels
+    /// and the reply maps back by position (labels dedupe like user
+    /// questions). Same fallback contract as [`elic_form_raw`], plus
+    /// `None` on empty options or answers outside the list.
+    async fn elicit_choice(
+        &self,
+        acp_sid: &str,
+        message: &str,
+        options: &[(String, String)],
+    ) -> Option<String> {
+        if options.is_empty() {
+            return None;
+        }
+        let display = dedupe_labels(options);
+        let content = self
+            .elicit_form_raw(
+                acp_sid,
+                message,
+                json!({"choice": {"type": "string", "enum": display}}),
+                &["choice"],
+            )
+            .await?;
+        let picked = content.get("choice").and_then(Value::as_str)?;
+        // Map back by position; answers outside the list never apply.
+        map_position(&display, picked).and_then(|i| options.get(i).map(|(v, _)| v.clone()))
+    }
+
+    /// Offer a select + free-text elicitation form (a child picker plus a
+    /// body field for the `message`/`followup` verbs) and await both
+    /// answers. Returns the mapped value and the body text, or `None`
+    /// under the same contract as [`elicit_choice`].
+    async fn elicit_select_with_text(
+        &self,
+        acp_sid: &str,
+        message: &str,
+        options: &[(String, String)],
+        text_field: &str,
+    ) -> Option<(String, String)> {
+        if options.is_empty() {
+            return None;
+        }
+        let display = dedupe_labels(options);
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "choice".to_string(),
+            json!({"type": "string", "enum": display}),
+        );
+        properties.insert(text_field.to_string(), json!({"type": "string"}));
+        let content = self
+            .elicit_form_raw(
+                acp_sid,
+                message,
+                Value::Object(properties),
+                &["choice", text_field],
+            )
+            .await?;
+        let picked = content.get("choice").and_then(Value::as_str)?;
+        let body = content
+            .get(text_field)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        map_position(&display, picked)
+            .and_then(|i| options.get(i).map(|(v, _)| v.clone()))
+            .map(|value| (value, body))
+    }
+
+    /// Offer a single free-text elicitation form and await the answer.
+    /// `None` under the same contract as [`elicit_choice`].
+    async fn elicit_text(&self, acp_sid: &str, message: &str, text_field: &str) -> Option<String> {
+        let mut properties = serde_json::Map::new();
+        properties.insert(text_field.to_string(), json!({"type": "string"}));
+        let content = self
+            .elicit_form_raw(acp_sid, message, Value::Object(properties), &[text_field])
+            .await?;
+        Some(
+            content
+                .get(text_field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        )
+    }
+
     /// `/models` (or `/model <id>`): list the catalog, or switch models.
     async fn run_models(
         &self,
@@ -883,6 +1320,26 @@ impl SessionStore {
             .models()
             .await
             .map_err(|e| AcpError::internal(format!("model/list failed: {e}")))?;
+        // Bare `/models` offers the picker form when the client can show
+        // one; anything else falls through to the list card.
+        if !catalog.models.is_empty() {
+            let options: Vec<(String, String)> = catalog
+                .models
+                .iter()
+                .map(|m| {
+                    (
+                        m.id.clone(),
+                        m.display_label.clone().unwrap_or_else(|| m.id.clone()),
+                    )
+                })
+                .collect();
+            if let Some(id) = self
+                .elicit_choice(acp_sid, "Select a model", &options)
+                .await
+            {
+                return self.run_model_select(acp_sid, msp_sid, &id).await;
+            }
+        }
         let current = {
             let inner = self.inner.lock().await;
             inner
@@ -948,6 +1405,20 @@ impl SessionStore {
         msp_sid: &str,
         arg: &str,
     ) -> Result<String, AcpError> {
+        // Bare or invalid `/effort` offers the picker form when the
+        // client can show one; the elicited tier is always valid.
+        if arg.is_empty() || !is_reasoning_effort(arg) {
+            let options: Vec<(String, String)> = EFFORT_TIERS
+                .iter()
+                .map(|t| (t.to_string(), t.to_string()))
+                .collect();
+            if let Some(tier) = self
+                .elicit_choice(acp_sid, "Select reasoning effort", &options)
+                .await
+            {
+                return self.run_effort_set(acp_sid, msp_sid, &tier).await;
+            }
+        }
         if arg.is_empty() {
             let effort = {
                 let inner = self.inner.lock().await;
@@ -968,6 +1439,16 @@ impl SessionStore {
                 EFFORT_TIERS.join(", ")
             ));
         }
+        self.run_effort_set(acp_sid, msp_sid, arg).await
+    }
+
+    /// `/effort <tier>` set path (the tier is already validated).
+    async fn run_effort_set(
+        &self,
+        acp_sid: &str,
+        msp_sid: &str,
+        arg: &str,
+    ) -> Result<String, AcpError> {
         let conn = self.ready_conn().await?;
         conn.command_with_retry(
             "session/setReasoningEffort",
@@ -1200,23 +1681,24 @@ impl SessionStore {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let owned: Vec<(String, String, String)> = {
+        let owned: Vec<(String, String, String, Option<String>)> = {
             let inner = self.inner.lock().await;
-            // (ACP id, MSP id, cwd), sorted for a stable listing.
+            // (ACP id, MSP id, cwd, folded name), sorted for a stable listing.
             let mut owned: Vec<_> = inner
                 .sessions
                 .iter()
-                .map(|(acp, s)| (acp.clone(), s.msp_sid.clone(), s.cwd.clone()))
+                .map(|(acp, s)| {
+                    (
+                        acp.clone(),
+                        s.msp_sid.clone(),
+                        s.cwd.clone(),
+                        s.facts.name.clone(),
+                    )
+                })
                 .collect();
             owned.sort();
             owned
         };
-        let entries: Vec<Value> = owned
-            .iter()
-            .map(|(acp, msp, cwd)| {
-                json!({"sessionId": acp, "cwd": cwd, "_meta": {"mspSessionId": msp}})
-            })
-            .collect();
         let conn = self.ready_conn().await?;
         let mut list_params = json!({
             "commandId": conn.mint_command_id(),
@@ -1225,28 +1707,33 @@ impl SessionStore {
         if !filter_root.is_empty() {
             list_params["workspaceRoot"] = Value::String(filter_root);
         }
+        // Host metadata enriches owned rows (last activity) and supplies
+        // importable foreign rows (past TUI/CLI sessions).
+        let mut host_meta: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+            std::collections::HashMap::new();
+        let mut host_items: Vec<Value> = Vec::new();
         match conn.command_with_retry("session/list", &list_params).await {
             Ok(listed) => {
-                let owned_msp: std::collections::HashSet<&str> =
-                    owned.iter().map(|(_, m, _)| m.as_str()).collect();
-                let mut entries = entries;
                 if let Some(items) = listed.get("sessions").and_then(Value::as_array) {
                     for item in items {
                         let msp_id = item.get("sessionId").and_then(Value::as_str).unwrap_or("");
-                        if msp_id.is_empty() || owned_msp.contains(msp_id) {
-                            continue; // already listed under its ACP id
+                        if msp_id.is_empty() {
+                            continue;
                         }
-                        let mut entry = json!({
-                            "sessionId": msp_id,
-                            "cwd": item.get("workspaceRoot").and_then(Value::as_str).unwrap_or(""),
-                        });
-                        if let Some(updated) = item.get("updatedAt").and_then(Value::as_str) {
-                            entry["updatedAt"] = Value::String(updated.to_string());
-                        }
-                        entries.push(entry);
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .filter(|n| !n.is_empty())
+                            .map(str::to_string);
+                        let updated = item
+                            .get("updatedAt")
+                            .and_then(Value::as_str)
+                            .filter(|u| !u.is_empty())
+                            .map(str::to_string);
+                        host_meta.insert(msp_id.to_string(), (name, updated));
+                        host_items.push(item.clone());
                     }
                 }
-                Ok(json!({"sessions": entries}))
             }
             Err(error) => {
                 tracing::warn!(
@@ -1254,9 +1741,68 @@ impl SessionStore {
                     message = %error.message,
                     "session/list failed; returning adapter-live sessions only"
                 );
-                Ok(json!({"sessions": entries}))
             }
         }
+        let owned_msp: std::collections::HashSet<&str> =
+            owned.iter().map(|(_, m, _, _)| m.as_str()).collect();
+        let mut entries: Vec<Value> = owned
+            .iter()
+            .map(|(acp, msp, cwd, name)| {
+                let mut entry = json!({
+                    "sessionId": acp,
+                    "cwd": cwd,
+                    "_meta": {"mspSessionId": msp},
+                });
+                // Title: folded name first, host name second; updatedAt from
+                // the host row. Absent fields stay absent (never blank).
+                let (host_name, host_updated) =
+                    host_meta.get(msp.as_str()).cloned().unwrap_or((None, None));
+                if let Some(title) = name.clone().filter(|n| !n.is_empty()).or(host_name) {
+                    entry["title"] = Value::String(title);
+                }
+                if let Some(updated) = host_updated {
+                    entry["updatedAt"] = Value::String(updated);
+                }
+                entry
+            })
+            .collect();
+        for item in &host_items {
+            let msp_id = item.get("sessionId").and_then(Value::as_str).unwrap_or("");
+            if msp_id.is_empty() || owned_msp.contains(msp_id) {
+                continue; // already listed under its ACP id
+            }
+            // `cwd` is required and must be absolute; a rootless host row
+            // cannot be represented, so skip it (debug, not warn: provider
+            // mode legitimately adopts a null root).
+            let Some(root) = item
+                .get("workspaceRoot")
+                .and_then(Value::as_str)
+                .filter(|r| r.starts_with('/'))
+            else {
+                tracing::debug!(
+                    session_id = msp_id,
+                    "session/list skips a rootless host row"
+                );
+                continue;
+            };
+            let mut entry = json!({"sessionId": msp_id, "cwd": root});
+            if let Some(title) = item
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+            {
+                entry["title"] = Value::String(title.to_string());
+            }
+            if let Some(updated) = item
+                .get("updatedAt")
+                .and_then(Value::as_str)
+                .filter(|u| !u.is_empty())
+            {
+                entry["updatedAt"] = Value::String(updated.to_string());
+            }
+            entries.push(entry);
+        }
+        Ok(json!({"sessions": entries}))
     }
 
     /// `session/resume` / `session/load`: re-attach a durable host session.
@@ -1383,6 +1929,7 @@ impl SessionStore {
                     pending_ui: Vec::new(),
                     ui_seen: HashSet::new(),
                     facts: SessionFacts::default(),
+                    children: HashMap::new(),
                 });
             entry.msp_sid = real_msp.clone();
             entry.ver = ver;
@@ -1403,7 +1950,7 @@ impl SessionStore {
                 .and_then(|m| m.get("mode"))
                 .and_then(Value::as_str)
             {
-                entry.mode = mode_from_msp(folded).to_string();
+                entry.mode = adopt_mode_label(&entry.mode, folded);
             }
             // Seed facts from the folded session object so /status and
             // /usage read real values before the first live event lands.
@@ -1413,6 +1960,10 @@ impl SessionStore {
             if let Some(branch) = session.get("branch") {
                 entry.facts.branch = Some(json!({"branch": branch.clone()}));
             }
+            // Seed child retention from history (whether or not this
+            // method replays frames) so /subagents and /workflows read
+            // resumed children.
+            seed_children(&mut entry.children, &resumed);
             (
                 entry.mode.clone(),
                 entry.model_value.clone(),
@@ -1437,18 +1988,8 @@ impl SessionStore {
         if ver != 2 {
             result["modes"] = session_modes(&mode_vocab);
         }
-        let skills = {
-            let inner = self.inner.lock().await;
-            inner
-                .sessions
-                .get(&sid)
-                .map(|s| s.skills.clone())
-                .unwrap_or_default()
-        };
-        let _ = self
-            .outbound
-            .send(available_commands_frame(&sid, ver, &skills))
-            .await;
+        // Slash commands advertise after the result frame (see
+        // `advertise_commands`).
         // A resumed session may hold approvals/prompts issued before the
         // attach: pull `approval/listPending` and present each unknown one
         // (the observer's live stream may have delivered them already —
@@ -1572,6 +2113,7 @@ impl SessionStore {
                             .map(|b| json!({"branch": b.clone()})),
                         ..SessionFacts::default()
                     },
+                    children: HashMap::new(),
                 },
             );
         }
@@ -1586,10 +2128,8 @@ impl SessionStore {
         if ver != 2 {
             result["modes"] = session_modes(&mode_vocab);
         }
-        let _ = self
-            .outbound
-            .send(available_commands_frame(&acp_sid, ver, &skills))
-            .await;
+        // Slash commands advertise after the result frame (see
+        // `advertise_commands`).
         Ok(result)
     }
 
@@ -1626,7 +2166,7 @@ impl SessionStore {
             "mode" => {
                 let Some(host_mode) = resolve_mode(&value) else {
                     return Err(AcpError::invalid_params(
-                        "mode must be ask|auto|deny".to_string(),
+                        "mode must be ask|auto|yolo|deny".to_string(),
                     ));
                 };
                 let set_params = json!({
@@ -1689,7 +2229,13 @@ impl SessionStore {
                         .as_deref()
                         .or_else(|| resolve_mode(&value))
                         .unwrap_or("promptUnmatched");
-                    session.mode = mode_from_msp(host_mode).to_string();
+                    // Yolo survives only on a true allowAll fold; a
+                    // downgraded apply falls back to the folded label.
+                    if value == "yolo" && host_mode == "allowAll" {
+                        session.mode = "yolo".to_string();
+                    } else {
+                        session.mode = mode_from_msp(host_mode).to_string();
+                    }
                 }
                 "model" => session.model_value.clone_from(&value),
                 "reasoning_effort" => session.reasoning_effort.clone_from(&value),
@@ -1711,8 +2257,8 @@ impl SessionStore {
         Ok(json!({"configOptions": options}))
     }
 
-    /// `session/set_mode`: the v1 operating-mode switch (`modeId` or legacy
-    /// `mode`), same ask|auto|deny vocabulary.
+    /// `session/set_mode`: the operating-mode switch (`modeId` or legacy
+    /// `mode`), same ask|auto|yolo|deny vocabulary.
     pub async fn set_mode(&self, params: &Value) -> Result<Value, AcpError> {
         let sid = params
             .get("sessionId")
@@ -1736,7 +2282,7 @@ impl SessionStore {
         };
         let Some(host_mode) = resolve_mode(&value) else {
             return Err(AcpError::invalid_params(
-                "mode must be ask|auto|deny".to_string(),
+                "mode must be ask|auto|yolo|deny".to_string(),
             ));
         };
         let conn = self.ready_conn().await?;
@@ -1750,7 +2296,13 @@ impl SessionStore {
             .map_err(|e| AcpError::msp_command("session/setApprovalMode", &e))?;
         let mut inner = self.inner.lock().await;
         if let Some(session) = inner.sessions.get_mut(&sid) {
-            session.mode = mode_from_msp(host_mode).to_string();
+            // Yolo is bridge-local (allowAll + no questions): keep the
+            // label — the host only knows allowAll.
+            if value == "yolo" {
+                session.mode = "yolo".to_string();
+            } else {
+                session.mode = mode_from_msp(host_mode).to_string();
+            }
         }
         Ok(json!({"mode": value}))
     }
@@ -2124,6 +2676,27 @@ impl SessionStore {
                 "approval/resolved" | "approval/updated" => {
                     if session.ver == 2 && !session.in_flight.is_empty() {
                         frames.push(state_update_frame(acp_sid, "running", None));
+                    }
+                }
+                // Model-spawned children: retain every revision, render
+                // only transitions (first sighting, status/detail moves,
+                // terminals) as `tool_call` blocks — the TUI's child
+                // blocks, in chat. Session-scoped, so idle completions
+                // land too; the rev guard makes redelivery converge.
+                "item/started" | "item/updated" | "item/completed" => {
+                    let item = params.get("item").cloned().unwrap_or(Value::Null);
+                    let item_id = item
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some((record, announce)) =
+                        fold_child_item(session.children.get(&item_id), method, &item)
+                    {
+                        let frame = announce
+                            .then(|| child_tool_frame(acp_sid, &item_id, &record, session.ver));
+                        session.children.insert(item_id, record);
+                        frames.extend(frame);
                     }
                 }
                 // Both legs of one pending request: the request and its
@@ -2510,7 +3083,7 @@ impl SessionStore {
         if user_input_id.is_empty() {
             return;
         }
-        {
+        let yolo = {
             let mut inner = self.inner.lock().await;
             let Some(session) = inner.sessions.get_mut(acp_sid) else {
                 return;
@@ -2524,6 +3097,21 @@ impl SessionStore {
                 return; // already presented or settled by us
             }
             session.ui_seen.insert(user_input_id.clone());
+            session.mode == "yolo"
+        };
+        // Yolo never interrupts: questions decline loudly with the durable
+        // id and the host proceeds without answers. (Host *approvals* are
+        // untouched — yolo must never synthesize an approval; under
+        // allowAll the host simply sends none.)
+        if yolo {
+            tracing::info!(
+                acp_sid,
+                user_input_id,
+                "yolo mode declines a user-input prompt (no questions)"
+            );
+            self.cancel_user_input(acp_sid, params, YOLO_NO_QUESTIONS_REASON)
+                .await;
+            return;
         }
         if self.elicitation_form.load(Ordering::SeqCst)
             && self.bridge_user_input(acp_sid, params).await
@@ -3761,18 +4349,28 @@ fn start_params(
 }
 
 /// Resolve the startup approval mode: `MUSE_APPROVAL_MODE` in either
-/// vocabulary, else [`DEFAULT_APPROVAL_MODE`]. Invalid values fail loudly.
-fn resolve_startup_mode() -> Result<String, AcpError> {
+/// vocabulary, else [`DEFAULT_APPROVAL_MODE`]. Returns the host mode plus
+/// the selector label (`yolo` survives as a label; every other value maps
+/// through [`mode_from_msp`]). Invalid values fail loudly.
+fn resolve_startup_mode() -> Result<(String, String), AcpError> {
     let raw = std::env::var(APPROVAL_MODE_ENV).unwrap_or_default();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(DEFAULT_APPROVAL_MODE.to_string());
+        let host = DEFAULT_APPROVAL_MODE.to_string();
+        let label = mode_from_msp(&host).to_string();
+        return Ok((host, label));
     }
-    resolve_mode(trimmed).map(str::to_string).ok_or_else(|| {
+    let host = resolve_mode(trimmed).map(str::to_string).ok_or_else(|| {
         AcpError::invalid_params(format!(
-            "{APPROVAL_MODE_ENV} must be ask|auto|deny or a host mode, got '{trimmed}'"
+            "{APPROVAL_MODE_ENV} must be ask|auto|yolo|deny or a host mode, got '{trimmed}'"
         ))
-    })
+    })?;
+    let label = if trimmed == "yolo" {
+        "yolo".to_string()
+    } else {
+        mode_from_msp(&host).to_string()
+    };
+    Ok((host, label))
 }
 
 /// Best-effort model id from a `session/start` session object (top-level
@@ -3813,13 +4411,27 @@ fn display_text(input: &TurnInput) -> String {
 // Mode vocabulary (ported from `muse-acp` `acp.rs`)
 // ---------------------------------------------------------------------------
 
-/// Our mode vocabulary → MSP `ApprovalMode`.
+/// Our mode vocabulary → MSP `ApprovalMode`. `yolo` is bridge-local
+/// (host `allowAll` plus auto-declined user questions); the host never
+/// reports it back, so adoption compares host modes, not labels.
 pub fn mode_to_msp(mode: &str) -> Option<&'static str> {
     match mode {
         "ask" => Some("promptUnmatched"),
         "auto" => Some("allowAll"),
+        "yolo" => Some("allowAll"),
         "deny" => Some("denyUnmatched"),
         _ => None,
+    }
+}
+
+/// Adopt a folded host mode as the session label. Host modes compare,
+/// not labels: yolo IS allowAll host-side, so a yolo session resuming
+/// onto allowAll keeps its label instead of degrading to auto.
+fn adopt_mode_label(current: &str, folded_host: &str) -> String {
+    if mode_to_msp(current).is_some_and(|h| h == folded_host) {
+        current.to_string()
+    } else {
+        mode_from_msp(folded_host).to_string()
     }
 }
 
@@ -3882,6 +4494,8 @@ enum ProtocolCommand {
     Stop,
     Goal,
     Tasks,
+    Subagents,
+    Workflows,
 }
 
 impl ProtocolCommand {
@@ -3900,6 +4514,8 @@ impl ProtocolCommand {
             ProtocolCommand::Stop => "stop",
             ProtocolCommand::Goal => "goal",
             ProtocolCommand::Tasks => "tasks",
+            ProtocolCommand::Subagents => "subagents",
+            ProtocolCommand::Workflows => "workflows",
         }
     }
 }
@@ -3925,6 +4541,12 @@ const PROTOCOL_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("stop", "Stop the in-flight turn", None),
     ("goal", "Show the session goal", None),
     ("tasks", "Show the session task list", None),
+    (
+        "subagents",
+        "Show model-spawned subagents; verbs control them",
+        Some("verb target"),
+    ),
+    ("workflows", "Show workflow runs", None),
     ("exit", "Close this session", None),
 ];
 
@@ -3961,6 +4583,8 @@ fn protocol_command(echo: &Value) -> Option<(ProtocolCommand, String)> {
         "stop" => ProtocolCommand::Stop,
         "goal" => ProtocolCommand::Goal,
         "tasks" => ProtocolCommand::Tasks,
+        "subagents" | "subagent" => ProtocolCommand::Subagents,
+        "workflows" | "workflow" => ProtocolCommand::Workflows,
         _ => return None,
     };
     Some((command, arg.to_string()))
@@ -4079,6 +4703,7 @@ pub fn config_options(
             "options": [
                 {"value": "ask", "name": "Ask", "description": "Request permission for unmatched tools"},
                 {"value": "auto", "name": "Auto", "description": "Allow all tools without asking"},
+                {"value": "yolo", "name": "Yolo", "description": "Allow all tools and skip questions"},
                 {"value": "deny", "name": "Deny", "description": "Deny unmatched tools"},
             ],
         },
@@ -4111,13 +4736,16 @@ pub fn config_options(
     ])
 }
 
-/// Legacy v1 mode state for clients which predate `configOptions`.
+/// `SessionModeState` for session responses (both versions): the
+/// ask|auto|yolo|deny switch for ModeSelector-path clients (Zed itself
+/// negotiates v1 and renders the `configOptions` buttons instead).
 pub fn session_modes(current_mode: &str) -> Value {
     json!({
         "currentModeId": current_mode,
         "availableModes": [
             {"id": "ask", "name": "Ask", "description": "Request permission for unmatched tools"},
             {"id": "auto", "name": "Auto", "description": "Allow all tools without asking"},
+            {"id": "yolo", "name": "Yolo", "description": "Allow all tools and skip questions"},
             {"id": "deny", "name": "Deny", "description": "Deny unmatched tools"},
         ],
     })
@@ -4437,6 +5065,478 @@ fn reject_additional_dirs(params: &Value) -> Result<(), AcpError> {
     Ok(())
 }
 
+/// Deduplicated display labels for an elicitation select, positionally
+/// aligned with `options` (shared by the single and select+text forms).
+fn dedupe_labels(options: &[(String, String)]) -> Vec<String> {
+    let mut display = Vec::with_capacity(options.len());
+    for (_, label) in options {
+        let mut name = label.clone();
+        let mut n = 2;
+        while display.iter().any(|e: &String| e == &name) {
+            name = format!("{label} ({n})");
+            n += 1;
+        }
+        display.push(name);
+    }
+    display
+}
+
+/// Position of a picked label in the deduped display list (`None` when
+/// the answer is outside the list — such answers never apply).
+fn map_position(display: &[String], picked: &str) -> Option<usize> {
+    display.iter().position(|d| d == picked)
+}
+
+/// Whether an MSP item status is terminal: anything other than
+/// `inProgress` (the schema's rule — unknown values are
+/// terminal-unknown, never silently open). An absent/empty status stays
+/// open: `item/started` carries no status and must not read as done.
+fn child_status_terminal(status: &str) -> bool {
+    !status.is_empty() && status != "inProgress"
+}
+
+/// MSP item status → ACP `ToolCallStatus`. The left side is an open
+/// vocabulary: unknown strings fail (visible, never a silent pass). v1
+/// has no `cancelled`, so cancellations fail there and cancel on v2.
+fn child_tool_status(status: &str, ver: u8) -> &'static str {
+    match status {
+        "" | "inProgress" => "in_progress",
+        "completed" => "completed",
+        "cancelled" if ver == 2 => "cancelled",
+        "cancelled" => "failed",
+        _ => "failed",
+    }
+}
+
+/// Short display suffix for a child id (ids are ASCII; first 8 read fine).
+fn child_short_id(item_id: &str) -> &str {
+    item_id.get(..8.min(item_id.len())).unwrap_or(item_id)
+}
+
+/// Card/picker mark for a retained child status: unknown (terminal-unknown
+/// per the schema) is a loud failure, never done and never hidden.
+fn child_mark(status: &str) -> char {
+    match status {
+        "completed" => 'x',
+        "inProgress" | "" => '~',
+        "cancelled" => '-',
+        _ => '!',
+    }
+}
+
+/// Non-blank string field of a view item.
+fn child_field<'a>(item: &'a Value, key: &str) -> Option<&'a str> {
+    item.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Display title for a `subagent`/`workflow` item: the objective or
+/// script identity, else the generic fallback, else an anonymous label
+/// (a child is always rendered — never dropped for lack of a name).
+fn child_title(kind: &str, item: &Value, item_id: &str) -> String {
+    if kind == "subagent" {
+        if let Some(objective) = child_field(item, "objective") {
+            return objective.trim().to_string();
+        }
+    } else if let Some(script) = child_field(item, "scriptId") {
+        return script.trim().to_string();
+    } else if let Some(entry) = child_field(item, "entryId") {
+        return entry.trim().to_string();
+    }
+    if let Some(fallback) = child_field(item, "fallbackText") {
+        return fallback.trim().to_string();
+    }
+    format!("{kind} {}", child_short_id(item_id))
+}
+
+/// Second-line detail: control/child state, plus the terminal message.
+/// Subagent durations render in seconds; workflow children count by
+/// reported terminals (the lifecycle status is durable vocabulary we
+/// relay, never interpret).
+fn child_detail(kind: &str, item: &Value) -> String {
+    let mut parts = Vec::new();
+    if kind == "subagent" {
+        if let Some(control) = child_field(item, "controlStatus") {
+            parts.push(control.trim().to_string());
+        }
+        if let Some(ms) = item.get("durationMs").and_then(Value::as_u64) {
+            parts.push(if ms >= 1000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{ms}ms")
+            });
+        }
+        if let Some(reason) = child_field(item, "failureReason") {
+            parts.push(reason.trim().to_string());
+        }
+        // A ready result surfaces in the line (capped — the full text
+        // rides the `/subagents result` card).
+        if let Some(summary) = item
+            .get("result")
+            .and_then(|r| r.get("summary"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            parts.push(format!("result: {}", truncate(summary, 120)));
+        }
+    } else {
+        let children = item
+            .get("children")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !children.is_empty() {
+            let done = children
+                .iter()
+                .filter(|c| child_field(c, "terminal").is_some())
+                .count();
+            parts.push(format!("{done}/{} children", children.len()));
+        }
+        if let Some(trigger) = child_field(item, "triggerSource") {
+            parts.push(trigger.trim().to_string());
+        }
+        if let Some(message) = child_field(item, "message") {
+            parts.push(message.trim().to_string());
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Fold one `subagent`/`workflow` view item: `None` when the event is
+/// for another kind, the item has no id, or the revision is stale
+/// (replace-iff-higher, like the turn fold); else the new record plus
+/// whether a visible transition occurred (first sighting, or a title /
+/// status / detail / terminal change). The caller retains the record
+/// and emits the `tool_call` frame only on transitions, so redelivery
+/// and gap-fill overlap converge without double-rendering.
+fn fold_child_item(
+    prev: Option<&ChildRecord>,
+    method: &str,
+    item: &Value,
+) -> Option<(ChildRecord, bool)> {
+    let kind = item.get("kind").and_then(Value::as_str).unwrap_or("");
+    if kind != "subagent" && kind != "workflow" {
+        return None;
+    }
+    let item_id = item.get("itemId").and_then(Value::as_str).unwrap_or("");
+    if item_id.is_empty() {
+        return None;
+    }
+    let rev = item
+        .get("revision")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .max(1);
+    if let Some(p) = prev
+        && rev <= p.rev
+    {
+        return None;
+    }
+    let status = child_field(item, "status").unwrap_or("").to_string();
+    // No delta stream depends on children staying open, so unlike the
+    // turn fold (where `item/started` never settles) a terminal status
+    // settles on any event; `item/completed` settles regardless.
+    let terminal = method == "item/completed" || child_status_terminal(&status);
+    let result = item.get("result").unwrap_or(&Value::Null);
+    let record = ChildRecord {
+        kind: kind.to_string(),
+        title: child_title(kind, item, item_id),
+        status,
+        detail: child_detail(kind, item),
+        rev,
+        terminal,
+        subagent_id: child_field(item, "subagentId").unwrap_or("").to_string(),
+        result_summary: result
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        result_text: result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    };
+    let announce = match prev {
+        None => true,
+        Some(p) => {
+            p.title != record.title
+                || p.status != record.status
+                || p.detail != record.detail
+                || p.terminal != record.terminal
+                || p.subagent_id != record.subagent_id
+                || p.result_summary != record.result_summary
+                || p.result_text != record.result_text
+        }
+    };
+    Some((record, announce))
+}
+
+/// `tool_call` upsert for a retained child — the TUI shows each child as
+/// its own block; so do we. Content rides terminal frames only (patch
+/// semantics: omitted fields leave the client's block unchanged).
+fn child_tool_frame(acp_sid: &str, item_id: &str, record: &ChildRecord, ver: u8) -> Value {
+    let mut update = json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": item_id,
+        "title": record.title,
+        "kind": "execute",
+        "status": child_tool_status(&record.status, ver),
+    });
+    if record.terminal && !record.detail.is_empty() {
+        update["content"] = json!([{"type": "text", "text": record.detail}]);
+    }
+    session_update_frame(acp_sid, update)
+}
+
+/// Seed child retention from resumed history (no frames — the replay
+/// already rendered them). Snapshots settle by status alone, so a child
+/// that is still running resumes open.
+fn seed_children(children: &mut HashMap<String, ChildRecord>, resume_res: &Value) {
+    let Some(items) = resume_res
+        .get("history")
+        .and_then(|h| h.get("items"))
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    for item in items {
+        let item_id = item.get("itemId").and_then(Value::as_str).unwrap_or("");
+        if item_id.is_empty() {
+            continue;
+        }
+        if let Some((record, _)) = fold_child_item(children.get(item_id), "item/updated", item) {
+            children.insert(item_id.to_string(), record);
+        }
+    }
+}
+
+/// `/subagents` + `/workflows` card body off retained children (pure;
+/// unit-tested). Sorted by title for stable output. Unknown statuses
+/// are terminal-unknown per the schema: loud failure marks, never
+/// presented as done and never hidden.
+fn render_children_card(
+    heading: &str,
+    kind: &str,
+    children: &HashMap<String, ChildRecord>,
+    empty: &str,
+) -> String {
+    let mut out = format!("**{heading}**\n\n");
+    let mut rows: Vec<&ChildRecord> = children.values().filter(|c| c.kind == kind).collect();
+    if rows.is_empty() {
+        out.push_str(empty);
+        out.push('\n');
+        return out;
+    }
+    rows.sort_by(|a, b| a.title.cmp(&b.title));
+    for child in rows {
+        let mark = child_mark(&child.status);
+        out.push_str(&format!("- [{mark}] {}", child.title));
+        if !child.detail.is_empty() {
+            out.push_str(&format!(" ({})", child.detail));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// One `/subagents` verb: the MSP method plus its arg shape. All eight
+/// control methods ack admission-only (`CommandAcceptedResult`) — even
+/// `readResult`, whose content rides the view stream — so every verb
+/// reports admission and the outcome lands in the child's block.
+struct SubagentVerb {
+    /// Canonical name (echoes in usage + ack cards).
+    name: &'static str,
+    /// MSP method.
+    method: &'static str,
+    /// Aliases accepted at parse.
+    aliases: &'static [&'static str],
+    /// Whether the verb needs a body (`message`, `followup`).
+    needs_body: bool,
+    /// Whether the verb takes a durable reason (`stop`, `interrupt`, `close`).
+    takes_reason: bool,
+    /// Ack lead word (`Stop requested`, `Note queued`, …).
+    ack: &'static str,
+}
+
+/// The eight `subagent/*` control verbs in help order.
+const SUBAGENT_VERBS: &[SubagentVerb] = &[
+    SubagentVerb {
+        name: "stop",
+        method: "subagent/stop",
+        aliases: &["kill", "halt"],
+        needs_body: false,
+        takes_reason: true,
+        ack: "Stop requested",
+    },
+    SubagentVerb {
+        name: "interrupt",
+        method: "subagent/interrupt",
+        aliases: &["yield", "pause"],
+        needs_body: false,
+        takes_reason: true,
+        ack: "Interrupt requested",
+    },
+    SubagentVerb {
+        name: "close",
+        method: "subagent/close",
+        aliases: &[],
+        needs_body: false,
+        takes_reason: true,
+        ack: "Close requested",
+    },
+    SubagentVerb {
+        name: "resume",
+        method: "subagent/resume",
+        aliases: &[],
+        needs_body: false,
+        takes_reason: false,
+        ack: "Resume requested",
+    },
+    SubagentVerb {
+        name: "reopen",
+        method: "subagent/reopen",
+        aliases: &[],
+        needs_body: false,
+        takes_reason: false,
+        ack: "Reopen requested",
+    },
+    SubagentVerb {
+        name: "message",
+        method: "subagent/sendMessage",
+        aliases: &["msg", "note", "tell", "say"],
+        needs_body: true,
+        takes_reason: false,
+        ack: "Note queued",
+    },
+    SubagentVerb {
+        name: "followup",
+        method: "subagent/followupTask",
+        aliases: &["follow-up", "task"],
+        needs_body: true,
+        takes_reason: false,
+        ack: "Follow-up queued",
+    },
+    SubagentVerb {
+        name: "result",
+        method: "subagent/readResult",
+        aliases: &["read"],
+        needs_body: false,
+        takes_reason: false,
+        ack: "Result requested",
+    },
+];
+
+/// Parse a verb word (canonical or alias, ASCII-insensitive).
+fn parse_subagent_verb(word: &str) -> Option<&'static SubagentVerb> {
+    let folded = word.to_ascii_lowercase();
+    SUBAGENT_VERBS
+        .iter()
+        .find(|v| v.name == folded || v.aliases.iter().any(|a| *a == folded))
+}
+
+/// Target resolution over retained children (verbs are subagent-only).
+enum ChildTarget {
+    /// Exactly one prefix match: the view `itemId` (the record is
+    /// re-read after any picker round-trip, so resolution keeps the id).
+    One(String),
+    /// No subagent matches (and no workflow matches either).
+    None,
+    /// Several subagent matches: disambiguate (cloned rows for options).
+    Many(Vec<(String, ChildRecord)>),
+    /// Only workflow runs match: verbs are subagent-only.
+    WorkflowOnly,
+}
+
+/// Resolve a target word: ASCII-insensitive prefix match over the view
+/// `itemId` and the durable `subagentId` (an empty durable id never
+/// matches). Sorted by title for stable picker order.
+fn resolve_subagent_target(children: &HashMap<String, ChildRecord>, target: &str) -> ChildTarget {
+    // Empty never resolves (every id is a prefix hit): the caller picks.
+    if target.is_empty() {
+        return ChildTarget::None;
+    }
+    let want = target.to_ascii_lowercase();
+    let mut hits: Vec<(String, ChildRecord)> = Vec::new();
+    let mut workflows = false;
+    for (id, child) in children {
+        let id_hit = id.to_ascii_lowercase().starts_with(&want);
+        let sub_hit = !child.subagent_id.is_empty()
+            && child.subagent_id.to_ascii_lowercase().starts_with(&want);
+        if !id_hit && !sub_hit {
+            continue;
+        }
+        if child.kind == "subagent" {
+            hits.push((id.clone(), child.clone()));
+        } else {
+            workflows = true;
+        }
+    }
+    hits.sort_by(|a, b| a.1.title.cmp(&b.1.title));
+    if hits.len() == 1 {
+        ChildTarget::One(hits.swap_remove(0).0)
+    } else if !hits.is_empty() {
+        ChildTarget::Many(hits)
+    } else if workflows {
+        ChildTarget::WorkflowOnly
+    } else {
+        ChildTarget::None
+    }
+}
+
+/// Elicitation options over subagent rows: `(itemId, "[mark] title (short id)")`.
+fn subagent_options(rows: &[(&str, &ChildRecord)]) -> Vec<(String, String)> {
+    let mut options: Vec<(String, String)> = rows
+        .iter()
+        .map(|(id, child)| {
+            (
+                id.to_string(),
+                format!(
+                    "[{}] {} ({})",
+                    child_mark(&child.status),
+                    child.title,
+                    child_short_id(id)
+                ),
+            )
+        })
+        .collect();
+    options.sort_by(|a, b| a.1.cmp(&b.1));
+    options
+}
+
+/// `/subagents` usage card (unknown verbs + arg-shape errors).
+fn subagents_usage() -> String {
+    String::from(
+        "**Subagents verbs**\n\n\
+         /subagents — list retained subagents\n\
+         /subagents <verb> [target] [text]\n\n\
+         Verbs: stop, interrupt, close, resume, reopen, message <text>, followup <text>, result\n\
+         Target: an id prefix, or pick from the selector when one is offered.\n",
+    )
+}
+
+/// `/subagents result` card off a retained result envelope (pure;
+/// unit-tested). Text caps at 2k chars — the envelope allows 32 KiB.
+fn render_result_card(title: &str, record: &ChildRecord) -> String {
+    let mut out = format!("**Result: {title}**\n\n");
+    if !record.result_summary.is_empty() {
+        out.push_str(&record.result_summary);
+        out.push('\n');
+    }
+    if !record.result_text.is_empty() {
+        if !record.result_summary.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&truncate(&record.result_text, 2000));
+        out.push('\n');
+    }
+    if record.result_summary.is_empty() && record.result_text.is_empty() {
+        out.push_str("No result retained yet.\n");
+    }
+    out
+}
+
 /// History replay for `session/load` (always) and v2 `session/resume` with
 /// `replayFrom`: user/agent messages replay as message updates/chunks,
 /// tool calls replay as completed tool updates (history carries args but
@@ -4484,6 +5584,18 @@ fn replay_history(acp_sid: &str, ver: u8, resume_res: &Value) -> Vec<Value> {
                         "content": [],
                     }),
                 ));
+            }
+            // Resumed children replay as their own blocks (status mapped
+            // to the ACP vocabulary); retention seeding happens at the
+            // `resume_or_load` call site.
+            "subagent" | "workflow" => {
+                let item_id = item.get("itemId").and_then(Value::as_str).unwrap_or("");
+                if item_id.is_empty() {
+                    continue;
+                }
+                if let Some((record, _)) = fold_child_item(None, "item/updated", item) {
+                    out.push(child_tool_frame(acp_sid, item_id, &record, ver));
+                }
             }
             "userMessage" | "agentMessage" => {
                 let text = item.get("text").and_then(Value::as_str).unwrap_or("");
@@ -5144,6 +6256,13 @@ mod tests {
             assert_eq!(items[1][key], Value::String("model".to_string()));
             assert_eq!(items[2][key], Value::String("reasoning_effort".to_string()));
             assert!(items[0].get("currentValue").is_some());
+            let modes: Vec<&str> = items[0]["options"]
+                .as_array()
+                .expect("mode options")
+                .iter()
+                .map(|o| o["value"].as_str().expect("mode value"))
+                .collect();
+            assert_eq!(modes, vec!["ask", "auto", "yolo", "deny"]);
         }
         // Empty catalog degrades to an empty model selector, not an error.
         let options = config_options(1, "ask", "m1", "medium", &[]);
@@ -5169,10 +6288,37 @@ mod tests {
     }
 
     #[test]
-    fn legacy_modes_carry_the_current_mode() {
+    fn session_modes_carry_the_current_mode() {
         let modes = session_modes("deny");
         assert_eq!(modes["currentModeId"], Value::String("deny".to_string()));
-        assert_eq!(modes["availableModes"].as_array().unwrap().len(), 3);
+        let ids: Vec<&str> = modes["availableModes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["ask", "auto", "yolo", "deny"]);
+    }
+
+    #[test]
+    fn yolo_maps_to_allow_all_but_is_never_reported() {
+        assert_eq!(mode_to_msp("yolo"), Some("allowAll"));
+        assert_eq!(resolve_mode("yolo"), Some("allowAll"));
+        // The host cannot express yolo; folded allowAll reads back auto.
+        assert_eq!(mode_from_msp("allowAll"), "auto");
+        assert_eq!(resolve_mode("bogus"), None);
+    }
+
+    #[test]
+    fn startup_mode_preserves_the_yolo_label() {
+        // resolve_startup_mode reads process env; yolo survives only as a
+        // label over a true allowAll fold (see create_session).
+        assert_eq!(mode_to_msp("yolo"), Some("allowAll"));
+        assert_eq!(adopt_mode_label("yolo", "allowAll"), "yolo");
+        assert_eq!(adopt_mode_label("yolo", "denyUnmatched"), "deny");
+        assert_eq!(adopt_mode_label("auto", "allowAll"), "auto");
+        assert_eq!(adopt_mode_label("ask", "allowAll"), "auto");
+        assert_eq!(adopt_mode_label("deny", "promptUnmatched"), "ask");
     }
 
     #[test]
@@ -5188,7 +6334,7 @@ mod tests {
         for ver in [1u8, 2u8] {
             let empty = available_commands(ver, &[]);
             let names_empty = names(&empty);
-            // Twelve protocol commands, the `skill` verb, then the curated
+            // Fourteen protocol commands, the `skill` verb, then the curated
             // fallback row when the registry misses.
             assert_eq!(names_empty.len(), PROTOCOL_COMMANDS.len() + 1 + 5);
             assert_eq!(names_empty[0], "compact");
@@ -5423,7 +6569,7 @@ mod tests {
             protocol_command(&json!([{"type": "text", "text": "/name New Session"}])).unwrap();
         assert_eq!(cmd.name(), "name");
         assert_eq!(arg, "New Session");
-        for slash in ["/stop", "/goal", "/tasks"] {
+        for slash in ["/stop", "/goal", "/tasks", "/subagents", "/workflows"] {
             assert_eq!(
                 parsed(&json!([{"type": "text", "text": slash}])),
                 Some(slash.trim_start_matches('/')),
@@ -5431,7 +6577,7 @@ mod tests {
             );
         }
         // The unmappable engine surfaces stay prompts, not commands.
-        for slash in ["/workflows", "/subagents", "/side", "/mcp"] {
+        for slash in ["/deep-research", "/side", "/mcp"] {
             assert_eq!(
                 parsed(&json!([{"type": "text", "text": slash}])),
                 None,
@@ -5566,6 +6712,527 @@ mod tests {
     }
 
     #[test]
+    fn child_status_maps_to_the_acp_vocabulary() {
+        // Open MSP vocabulary on the left: unknown strings fail loudly,
+        // never complete silently. v1 has no `cancelled`.
+        for (status, ver, want) in [
+            ("", 1, "in_progress"),
+            ("inProgress", 1, "in_progress"),
+            ("inProgress", 2, "in_progress"),
+            ("completed", 1, "completed"),
+            ("completed", 2, "completed"),
+            ("cancelled", 1, "failed"),
+            ("cancelled", 2, "cancelled"),
+            ("failed", 1, "failed"),
+            ("rejected", 2, "failed"),
+            ("timedOut", 1, "failed"),
+            ("zonked", 1, "failed"),
+            ("zonked", 2, "failed"),
+        ] {
+            assert_eq!(child_tool_status(status, ver), want, "{status}/v{ver}");
+        }
+        assert!(!child_status_terminal(""));
+        assert!(!child_status_terminal("inProgress"));
+        for terminal in [
+            "completed",
+            "failed",
+            "cancelled",
+            "rejected",
+            "timedOut",
+            "zonked",
+        ] {
+            assert!(child_status_terminal(terminal), "{terminal} is terminal");
+        }
+    }
+
+    #[test]
+    fn child_titles_prefer_identity_then_fallback() {
+        let title = |item: Value| {
+            child_title(
+                item.get("kind").and_then(Value::as_str).unwrap(),
+                &item,
+                item.get("itemId").and_then(Value::as_str).unwrap(),
+            )
+        };
+        assert_eq!(
+            title(json!({"kind": "subagent", "itemId": "a1", "objective": " Explore X "})),
+            "Explore X"
+        );
+        assert_eq!(
+            title(
+                json!({"kind": "workflow", "itemId": "b2", "scriptId": "research", "entryId": "e"})
+            ),
+            "research"
+        );
+        assert_eq!(
+            title(json!({"kind": "workflow", "itemId": "b2", "entryId": "entry-7"})),
+            "entry-7"
+        );
+        assert_eq!(
+            title(json!({"kind": "subagent", "itemId": "c3", "fallbackText": "a child"})),
+            "a child"
+        );
+        // Anonymous children still render — never dropped for no name.
+        assert_eq!(
+            title(json!({"kind": "subagent", "itemId": "abcdef123456"})),
+            "subagent abcdef12"
+        );
+    }
+
+    #[test]
+    fn child_details_carry_control_and_terminal_state() {
+        let detail =
+            |item: &Value| child_detail(item.get("kind").and_then(Value::as_str).unwrap(), item);
+        assert_eq!(
+            detail(&json!({
+                "kind": "subagent",
+                "controlStatus": "running",
+                "durationMs": 12_500,
+            })),
+            "running · 12.5s"
+        );
+        assert_eq!(
+            detail(&json!({"kind": "subagent", "durationMs": 300})),
+            "300ms"
+        );
+        assert_eq!(
+            detail(&json!({
+                "kind": "subagent",
+                "controlStatus": "closed",
+                "failureReason": "boom",
+            })),
+            "closed · boom"
+        );
+        assert_eq!(
+            detail(&json!({
+                "kind": "workflow",
+                "triggerSource": "modelProposal",
+                "children": [
+                    {"childId": "a", "attempt": 1, "status": "done", "terminal": "completed"},
+                    {"childId": "b", "attempt": 1, "status": "running"},
+                ],
+            })),
+            "1/2 children · modelProposal"
+        );
+        assert_eq!(
+            detail(&json!({"kind": "workflow", "message": "all green"})),
+            "all green"
+        );
+        assert!(detail(&json!({"kind": "subagent"})).is_empty());
+    }
+
+    #[test]
+    fn child_fold_announces_transitions_and_holds_stale_revs() {
+        let item = |rev: u64, status: &str| {
+            json!({
+                "kind": "subagent",
+                "itemId": "child-1",
+                "revision": rev,
+                "status": status,
+                "objective": "Explore X",
+                "controlStatus": "running",
+            })
+        };
+        // First sighting announces.
+        let (first, announce) = fold_child_item(None, "item/started", &item(1, "")).unwrap();
+        assert!(announce);
+        assert!(!first.terminal);
+        assert_eq!(first.title, "Explore X");
+        // Stale revisions hold (redelivery converges silently).
+        assert!(fold_child_item(Some(&first), "item/updated", &item(1, "")).is_none());
+        // Same content at a higher rev retains without re-announcing.
+        let (same, announce) = fold_child_item(Some(&first), "item/updated", &item(2, "")).unwrap();
+        assert!(!announce);
+        // A status move announces.
+        let (running, announce) =
+            fold_child_item(Some(&same), "item/updated", &item(3, "inProgress")).unwrap();
+        assert!(announce);
+        assert!(!running.terminal);
+        // Terminal announces and sticks.
+        let (done, announce) =
+            fold_child_item(Some(&running), "item/completed", &item(4, "completed")).unwrap();
+        assert!(announce);
+        assert!(done.terminal);
+        // A terminal status settles on any event (no delta stream to protect).
+        let (failed, _) = fold_child_item(
+            None,
+            "item/started",
+            &json!({
+                "kind": "subagent",
+                "itemId": "child-2",
+                "revision": 1,
+                "status": "failed",
+                "objective": "Doomed",
+            }),
+        )
+        .unwrap();
+        assert!(failed.terminal);
+        // Other kinds, missing ids, and missing revisions never fold.
+        assert!(
+            fold_child_item(
+                None,
+                "item/started",
+                &json!({"kind": "toolCall", "itemId": "t"})
+            )
+            .is_none()
+        );
+        assert!(fold_child_item(None, "item/started", &json!({"kind": "subagent"})).is_none());
+    }
+
+    #[test]
+    fn child_frames_carry_blocks_and_terminal_content() {
+        let (spawn, _) = fold_child_item(
+            None,
+            "item/started",
+            &json!({
+                "kind": "subagent",
+                "itemId": "child-1",
+                "revision": 1,
+                "objective": "Explore X",
+            }),
+        )
+        .unwrap();
+        let frame = child_tool_frame("s", "child-1", &spawn, 1);
+        let update = &frame["params"]["update"];
+        assert_eq!(update["sessionUpdate"], json!("tool_call"));
+        assert_eq!(update["toolCallId"], json!("child-1"));
+        assert_eq!(update["title"], json!("Explore X"));
+        assert_eq!(update["status"], json!("in_progress"));
+        assert!(update.get("content").is_none(), "no content while open");
+        let (done, _) = fold_child_item(
+            Some(&spawn),
+            "item/completed",
+            &json!({
+                "kind": "subagent",
+                "itemId": "child-1",
+                "revision": 2,
+                "status": "failed",
+                "objective": "Explore X",
+                "controlStatus": "closed",
+                "failureReason": "boom",
+            }),
+        )
+        .unwrap();
+        let terminal = child_tool_frame("s", "child-1", &done, 1)["params"]["update"].clone();
+        assert_eq!(terminal["status"], json!("failed"));
+        assert_eq!(
+            terminal["content"],
+            json!([{"type": "text", "text": "closed · boom"}])
+        );
+        let (cancelled, _) = fold_child_item(
+            None,
+            "item/completed",
+            &json!({
+                "kind": "workflow",
+                "itemId": "wf-1",
+                "revision": 1,
+                "status": "cancelled",
+                "scriptId": "research",
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            child_tool_frame("s", "wf-1", &cancelled, 1)["params"]["update"]["status"],
+            json!("failed"),
+            "v1 has no cancelled"
+        );
+        assert_eq!(
+            child_tool_frame("s", "wf-1", &cancelled, 2)["params"]["update"]["status"],
+            json!("cancelled")
+        );
+    }
+
+    #[test]
+    fn children_cards_filter_sort_and_mark() {
+        let mut children = HashMap::new();
+        for (id, item) in [
+            (
+                "z-done",
+                json!({"kind": "subagent", "itemId": "z-done", "revision": 2,
+                       "status": "completed", "objective": "Zebra"}),
+            ),
+            (
+                "a-run",
+                json!({"kind": "subagent", "itemId": "a-run", "revision": 1,
+                       "status": "inProgress", "objective": "Apple",
+                       "controlStatus": "running"}),
+            ),
+            (
+                "m-weird",
+                json!({"kind": "subagent", "itemId": "m-weird", "revision": 1,
+                       "status": "zonked", "objective": "Mango"}),
+            ),
+            (
+                "w-flow",
+                json!({"kind": "workflow", "itemId": "w-flow", "revision": 1,
+                       "status": "inProgress", "scriptId": "research"}),
+            ),
+        ] {
+            let (record, _) = fold_child_item(None, "item/updated", &item).unwrap();
+            children.insert(id.to_string(), record);
+        }
+        let card = render_children_card(
+            "Subagents",
+            "subagent",
+            &children,
+            "No subagents observed yet this session.",
+        );
+        for want in [
+            "**Subagents**",
+            "- [~] Apple (running)",
+            "- [!] Mango",
+            "- [x] Zebra",
+        ] {
+            assert!(card.contains(want), "card has {want}: {card}");
+        }
+        assert!(!card.contains("research"), "workflows stay out: {card}");
+        assert!(
+            card.find("Apple").unwrap() < card.find("Mango").unwrap(),
+            "sorted by title: {card}"
+        );
+        let flows = render_children_card(
+            "Workflows",
+            "workflow",
+            &children,
+            "No workflow runs observed yet this session.",
+        );
+        assert!(flows.contains("- [~] research"), "{flows}");
+        assert!(!flows.contains("Apple"), "{flows}");
+        assert!(
+            render_children_card("Subagents", "subagent", &HashMap::new(), "empty-mark")
+                .contains("empty-mark")
+        );
+    }
+
+    #[test]
+    fn seed_children_keeps_resumed_history_and_running_open() {
+        let mut children = HashMap::new();
+        seed_children(
+            &mut children,
+            &json!({"history": {"items": [
+                {"kind": "subagent", "itemId": "old", "revision": 3,
+                 "status": "completed", "objective": "Old work"},
+                {"kind": "workflow", "itemId": "live", "revision": 1,
+                 "status": "inProgress", "scriptId": "research"},
+                {"kind": "toolCall", "itemId": "t", "revision": 1},
+                {"kind": "subagent", "revision": 1, "objective": "no id"},
+            ]}}),
+        );
+        assert_eq!(children.len(), 2);
+        assert!(children["old"].terminal);
+        assert!(!children["live"].terminal);
+        assert_eq!(children["live"].title, "research");
+        // Unknown shapes seed nothing, never fail.
+        seed_children(&mut children, &json!({}));
+        seed_children(&mut children, &json!({"history": {"mode": "none"}}));
+        assert_eq!(children.len(), 2);
+    }
+
+    #[test]
+    fn replay_history_renders_resumed_children_as_blocks() {
+        let frames = replay_history(
+            "s",
+            1,
+            &json!({"history": {"items": [
+                {"kind": "subagent", "itemId": "child-1", "revision": 2,
+                 "status": "failed", "objective": "Explore X",
+                 "controlStatus": "closed", "failureReason": "boom"},
+            ]}}),
+        );
+        assert_eq!(frames.len(), 1);
+        let update = &frames[0]["params"]["update"];
+        assert_eq!(update["sessionUpdate"], json!("tool_call"));
+        assert_eq!(update["toolCallId"], json!("child-1"));
+        assert_eq!(update["status"], json!("failed"));
+        assert_eq!(
+            update["content"],
+            json!([{"type": "text", "text": "closed · boom"}])
+        );
+    }
+
+    #[test]
+    fn subagent_verbs_parse_with_aliases() {
+        for (word, method, needs_body) in [
+            ("stop", "subagent/stop", false),
+            ("KILL", "subagent/stop", false),
+            ("halt", "subagent/stop", false),
+            ("interrupt", "subagent/interrupt", false),
+            ("yield", "subagent/interrupt", false),
+            ("pause", "subagent/interrupt", false),
+            ("close", "subagent/close", false),
+            ("resume", "subagent/resume", false),
+            ("reopen", "subagent/reopen", false),
+            ("message", "subagent/sendMessage", true),
+            ("msg", "subagent/sendMessage", true),
+            ("note", "subagent/sendMessage", true),
+            ("tell", "subagent/sendMessage", true),
+            ("followup", "subagent/followupTask", true),
+            ("follow-up", "subagent/followupTask", true),
+            ("task", "subagent/followupTask", true),
+            ("result", "subagent/readResult", false),
+            ("read", "subagent/readResult", false),
+        ] {
+            let verb = parse_subagent_verb(word).unwrap_or_else(|| panic!("{word} parses"));
+            assert_eq!(verb.method, method, "{word}");
+            assert_eq!(verb.needs_body, needs_body, "{word}");
+        }
+        assert_eq!(SUBAGENT_VERBS.len(), 8);
+        assert!(parse_subagent_verb("explode").is_none());
+        assert!(parse_subagent_verb("").is_none());
+    }
+
+    #[test]
+    fn subagent_targets_resolve_prefixes() {
+        let mut children = HashMap::new();
+        for (id, item) in [
+            (
+                "child-1",
+                json!({"kind": "subagent", "itemId": "child-1", "revision": 1,
+                       "status": "inProgress", "objective": "Explore",
+                       "subagentId": "sa-1111"}),
+            ),
+            (
+                "child-2",
+                json!({"kind": "subagent", "itemId": "child-2", "revision": 1,
+                       "status": "inProgress", "objective": "Build",
+                       "subagentId": "sa-2222"}),
+            ),
+            (
+                "wf-1",
+                json!({"kind": "workflow", "itemId": "wf-1", "revision": 1,
+                       "status": "inProgress", "scriptId": "research"}),
+            ),
+        ] {
+            let (record, _) = fold_child_item(None, "item/updated", &item).unwrap();
+            children.insert(id.to_string(), record);
+        }
+        // Exact + prefix + durable-id + case-insensitive ("child-"
+        // hits both children, so it resolves under Many below).
+        for target in ["child-1", "sa-1111", "sa-11", "SA-11", "Child-1"] {
+            assert!(
+                matches!(resolve_subagent_target(&children, target), ChildTarget::One(id) if id == "child-1"),
+                "{target} resolves to child-1"
+            );
+        }
+        // Ambiguity sorts by title for stable picker order.
+        match resolve_subagent_target(&children, "child") {
+            ChildTarget::Many(rows) => {
+                let titles: Vec<&str> = rows.iter().map(|(_, c)| c.title.as_str()).collect();
+                assert_eq!(titles, vec!["Build", "Explore"]);
+            }
+            _ => panic!("expected Many for the shared prefix"),
+        }
+        assert!(matches!(
+            resolve_subagent_target(&children, "wf"),
+            ChildTarget::WorkflowOnly
+        ));
+        assert!(matches!(
+            resolve_subagent_target(&children, "zzz"),
+            ChildTarget::None
+        ));
+        assert!(matches!(
+            resolve_subagent_target(&children, ""),
+            ChildTarget::None
+        ));
+    }
+
+    #[test]
+    fn subagent_options_label_rows() {
+        let mut children = HashMap::new();
+        for (id, item) in [
+            (
+                "child-1",
+                json!({"kind": "subagent", "itemId": "child-1", "revision": 1,
+                       "status": "inProgress", "objective": "Explore"}),
+            ),
+            (
+                "child-2",
+                json!({"kind": "subagent", "itemId": "child-2", "revision": 1,
+                       "status": "failed", "objective": "Build"}),
+            ),
+        ] {
+            let (record, _) = fold_child_item(None, "item/updated", &item).unwrap();
+            children.insert(id.to_string(), record);
+        }
+        let rows: Vec<(&str, &ChildRecord)> =
+            children.iter().map(|(id, c)| (id.as_str(), c)).collect();
+        assert_eq!(
+            subagent_options(&rows),
+            vec![
+                ("child-2".to_string(), "[!] Build (child-2)".to_string()),
+                ("child-1".to_string(), "[~] Explore (child-1)".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn result_card_renders_and_caps() {
+        let record = |summary: &str, text: &str| ChildRecord {
+            kind: "subagent".to_string(),
+            title: "Explore".to_string(),
+            status: "completed".to_string(),
+            detail: String::new(),
+            rev: 2,
+            terminal: true,
+            subagent_id: "sa-1".to_string(),
+            result_summary: summary.to_string(),
+            result_text: text.to_string(),
+        };
+        let card = render_result_card("Explore", &record("short summary", "line one\nline two"));
+        for want in ["**Result: Explore**", "short summary", "line one\nline two"] {
+            assert!(card.contains(want), "{want}: {card}");
+        }
+        let long = "x".repeat(3000);
+        let capped = render_result_card("Explore", &record("", &long));
+        assert!(capped.contains('…'), "long text caps: {capped}");
+        assert!(!capped.contains(&long), "full text never inlines");
+        assert!(render_result_card("Explore", &record("", "")).contains("No result retained yet."));
+    }
+
+    #[test]
+    fn fold_retains_durable_id_and_result() {
+        let (first, _) = fold_child_item(
+            None,
+            "item/started",
+            &json!({
+                "kind": "subagent", "itemId": "child-1", "revision": 1,
+                "objective": "Explore", "subagentId": "sa-1",
+            }),
+        )
+        .unwrap();
+        assert_eq!(first.subagent_id, "sa-1");
+        assert!(first.result_summary.is_empty());
+        // A result landing announces (new detail + new fields).
+        let (done, announce) = fold_child_item(
+            Some(&first),
+            "item/completed",
+            &json!({
+                "kind": "subagent", "itemId": "child-1", "revision": 2,
+                "status": "completed", "objective": "Explore", "subagentId": "sa-1",
+                "result": {"summary": "found it", "text": "the thing"},
+            }),
+        )
+        .unwrap();
+        assert!(announce);
+        assert_eq!(done.result_summary, "found it");
+        assert_eq!(done.result_text, "the thing");
+        assert!(done.detail.contains("result: found it"), "{}", done.detail);
+    }
+
+    #[test]
+    fn dedupe_labels_number_repeats_and_map_rejects_outsiders() {
+        let options = vec![
+            ("a".to_string(), "Same".to_string()),
+            ("b".to_string(), "Same".to_string()),
+            ("c".to_string(), "Other".to_string()),
+        ];
+        let display = dedupe_labels(&options);
+        assert_eq!(display, vec!["Same", "Same (2)", "Other"]);
+        assert_eq!(map_position(&display, "Same (2)"), Some(1));
+        assert_eq!(map_position(&display, "Missing"), None);
+    }
+
+    #[test]
     fn steering_gate_reads_the_idle_behavior() {
         assert!(!steering_prompt_required(&json!({})).unwrap());
         assert!(!steering_prompt_required(&json!({"_meta": null})).unwrap());
@@ -5624,7 +7291,7 @@ mod tests {
                 {"itemId": "a1", "kind": "agentMessage", "text": "a"},
                 {"itemId": "t1", "kind": "toolCall", "tool": "shell",
                  "status": "completed", "fallbackText": "ran it"},
-                {"itemId": "x1", "kind": "workflow", "text": "noise"},
+                {"itemId": "x1", "kind": "reminderChild", "text": "noise"},
             ]},
         });
         let v1 = replay_history("s", 1, &resumed);

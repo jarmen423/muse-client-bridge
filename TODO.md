@@ -5,10 +5,15 @@
   │ Area            │ CLI            │ Bridge           │
   ├─────────────────┼────────────────┼──────────────────┤
   │ Approval switch │ ask/auto/deny  │ yes, live picker │
+  │ Yolo mode       │ n/a (TUI ask)  │ yes, picker+auto │
   │ Model switch    │ /model picker  │ yes, live picker │
   │ Effort tiers    │ 8 tiers        │ yes, picker now  │
   │ Sessions        │ resume/fork    │ yes, both        │
   │ /compact        │ compact        │ yes, inline      │
+  │ Child blocks    │ TUI blocks     │ yes, tool_call   │
+  │ /subagents      │ spawn list     │ yes, card        │
+  │ Child verbs     │ 8 ctrls        │ yes, all 8       │
+  │ /workflows      │ run list       │ yes, card        │
   │ /skill invoke   │ any skill      │ yes, syntax      │
   │ Queue/steer     │ composer queue │ yes, v2 steer    │
   │ Images          │ attach         │ yes              │
@@ -32,7 +37,10 @@
   • /side, /memory, /rules, /mcp — host mapping unknown; needs a spike before committing.
   • /init, /deep-research — agentic flows; could be sent as directed turns, needs design.
   • /export — we'd have to write transcript files to disk; new behavior, your call.
-  • /goal, /tasks, /workflows, /subagents, /stop — goal/subagent/workflow engine; a project, not a command.
+  • /goal, /tasks, /stop — LANDED as read-only cards (see the
+  spike section). /workflows, /subagents — display LANDED
+  (retention + live blocks + cards); all eight control verbs
+  LANDED via `/subagents <verb> [target] [text]` + selectors.
   • Permission profiles, sandbox toggles, worktrees — CLI startup-only surfaces with no ACP shape yet.
   • Cross-session messaging — not surfaced.
 
@@ -100,10 +108,48 @@ binary strings plus the local MSP schema bundle.
   `session/todoListChanged` items (`[x]/[~]/[ ]/[-]` marks, the running
   item in its `activeForm`). Unknown statuses stay open, never
   finished — same rule as the ACP `plan` entries.
-- `/workflows` `/subagents` — DEFERRED (no wire to map): MSP exposes
-  control ops (`subagent/stop|interrupt|readResult|sendMessage|resume|
-  followupTask|close|reopen`) but **no list method**, and membership
-  lives in view items the bridge does not retain — there is nothing
-  truthful for a card to show. Management verbs have no ACP shape
-  either. They stay plain prompt text (the model sees them); revisit
-  if MSP gains a list method or ACP gains a subagent surface.
+- `/workflows` `/subagents` — DISPLAY DONE (this change;
+  supersedes the DEFERRED verdict below it): the "no list method"
+  reading was wrong — the view stream IS the list. The observer
+  now retains `subagent`/`workflow` items session-wide
+  (replace-iff-higher `revision`, idle completions included),
+  streams each child as its own `tool_call` block on transitions
+  (spawn → progress → terminal, TUI-style), and `/subagents` +
+  `/workflows` cards plus history replay read the retention
+  (resume seeds it, so imported sessions show children).
+  VERBS DONE (this change): all eight ride `/subagents <verb>
+  [target] [text]` — targets resolve by id prefix (durable id
+  retained for control) with an elicitation selector fallback,
+  `message`/`followup` take body text inline or via a select+text
+  form, `result` renders the retained envelope and consumes via
+  `readResult` only when nothing is kept. Every verb reports
+  admission; outcomes land in the child's block. `/deep-research`
+  stays plain prompt text: no workflow-launch method exists.
+  - ~~DEFERRED (no wire to map): MSP exposes control ops but **no
+    list method**, and membership lives in view items the bridge
+    does not retain — revisit if MSP gains a list method.~~
+
+## Zed 1.19.2 client behavior (verified from source, this change)
+
+Evidence in `.cache/reference/zed/v1.19.2/`, ACP schemas in
+`.cache/reference/acp-protocol/`.
+
+- `session/new` updates must trail the result: Zed registers update
+  routing only after the response arrives, so a pre-result
+  `available_commands_update` is dropped and `/` stays empty. (Load
+  and resume pre-register — history replay still streams first, per
+  spec.) Both references send result first; so do we now, on all
+  four session RPCs.
+- Zed 1.19.2 negotiates ACP **v1**: the prominent ModeSelector
+  renders only with `modes` and NO `configOptions` (`config_state`
+  is all-or-nothing), but we keep `configOptions` (mode/model/
+  effort buttons, one per option) because that is where the model
+  and effort pickers live — `modes` rides along on v1 for
+  ModeSelector-path clients. ACP v2 defines no modes at all, but
+  Zed's `agent-client-protocol` 2.0.0 crate still reads `modes`
+  and sends `session/set_mode`.
+- Import sessions: Zed calls `session/list` (cwd-filtered) and
+  opens entries via `session/load` (gated on the v1
+  `loadSession` cap, which we advertise). Entries need absolute
+  `cwd`s — rootless host rows are skipped, never emitted blank —
+  and titles + `updatedAt` come from folded/host metadata.

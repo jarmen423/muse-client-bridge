@@ -241,8 +241,8 @@ async fn acp_v1_round_trip_streams_chunks_and_stop_reason() {
         json!("muse-acp-bridge")
     );
 
-    // session/new → ACP id + selectors + legacy modes; the fake echoes
-    // denyUnmatched, which the skeleton adopts (warn-loudly, never fail).
+    // session/new → ACP id + modes; the fake echoes denyUnmatched,
+    // which the bridge adopts (warn-loudly, never fail).
     client
         .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
             "params": {"cwd": cwd.to_string_lossy()}}))
@@ -265,7 +265,7 @@ async fn acp_v1_round_trip_streams_chunks_and_stop_reason() {
     assert_eq!(
         new_result["result"]["modes"]["currentModeId"],
         json!("deny"),
-        "fake echoes denyUnmatched; the skeleton adopts it"
+        "fake echoes denyUnmatched; the bridge adopts it"
     );
     assert!(
         new_result["result"]["configOptions"][1]["options"]
@@ -275,11 +275,13 @@ async fn acp_v1_round_trip_streams_chunks_and_stop_reason() {
             .any(|o| o["value"] == json!("fake-a")),
         "model selector carries the fake catalog"
     );
+    // The advertisement immediately follows the result (update routing
+    // only exists once the response arrives).
+    let advertised = drain_advertisement(&mut client).await;
     assert!(
-        frames
-            .iter()
-            .any(|f| f.get("method") == Some(&json!("session/update"))
-                && f["params"]["update"]["sessionUpdate"] == json!("available_commands_update")),
+        advertised["params"]["update"]["availableCommands"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty()),
         "available_commands_update is advertised"
     );
     // The START reached the host with the resolved posture + workspace root.
@@ -392,6 +394,15 @@ async fn acp_v2_chunks_carry_message_ids_and_state_updates() {
         frames.last().unwrap()["result"].get("modes").is_none(),
         "v2 omits the legacy modes block"
     );
+    assert_eq!(
+        frames.last().unwrap()["result"]["configOptions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3,
+        "v2 carries the selectors"
+    );
+    drain_advertisement(&mut client).await;
 
     client
         .send(
@@ -464,6 +475,7 @@ async fn acp_prompt_rejects_unknown_sessions_and_empty_content() {
         .as_str()
         .unwrap()
         .to_string();
+    drain_advertisement(&mut client).await;
     client
         .send(
             &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
@@ -618,6 +630,7 @@ async fn acp_session_list_merges_owned_and_host() {
         .as_str()
         .unwrap()
         .to_string();
+    drain_advertisement(&mut client).await;
     client
         .send(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/list", "params": {}}))
         .await;
@@ -625,12 +638,25 @@ async fn acp_session_list_merges_owned_and_host() {
     let sessions = listed["result"]["sessions"].as_array().unwrap();
     assert_eq!(sessions[0]["sessionId"], json!(acp_sid), "owned first");
     assert!(sessions[0]["_meta"]["mspSessionId"].is_string());
-    assert!(
-        sessions
-            .iter()
-            .any(|s| s["sessionId"] == json!("fake-sess-host-only")),
-        "host-only sessions surface under their MSP id: {sessions:?}"
+    // Import metadata: owned rows inherit the host row's activity, and
+    // host-only rows carry everything Zed's importer shows.
+    assert_eq!(
+        sessions[0]["updatedAt"],
+        json!("2026-09-14T00:00:00Z"),
+        "owned rows inherit host activity: {sessions:?}"
     );
+    assert_eq!(
+        sessions[0]["title"],
+        json!("fake session"),
+        "owned rows inherit the host name: {sessions:?}"
+    );
+    let foreign = sessions
+        .iter()
+        .find(|s| s["sessionId"] == json!("fake-sess-host-only"))
+        .expect("host-only sessions surface under their MSP id");
+    assert_eq!(foreign["cwd"], json!("/tmp/fake-ws"));
+    assert_eq!(foreign["updatedAt"], json!("2026-09-15T00:00:00Z"));
+    assert_eq!(foreign["title"], json!("fake session"));
     client.shutdown().await;
 }
 
@@ -699,6 +725,7 @@ async fn acp_selectors_round_trip_mode_model_effort() {
         .as_str()
         .unwrap()
         .to_string();
+    drain_advertisement(&mut client).await;
     // Mode selector: the fake echoes the folded mode.
     client
         .send(
@@ -827,6 +854,7 @@ async fn acp_fork_branches_history_with_cut_points() {
         .await;
     let frames = client.recv_until(|f| f.get("id") == Some(&json!(4))).await;
     assert!(frames.last().unwrap().get("result").is_some(), "{frames:?}");
+    drain_advertisement(&mut client).await;
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
         log_text.contains("cut=h-turn-1"),
@@ -912,6 +940,7 @@ async fn acp_steering_starts_injects_or_defers() {
         .as_str()
         .unwrap()
         .to_string();
+    drain_advertisement(&mut client).await;
     // Steering is v2-only.
     client
         .send(
@@ -940,6 +969,7 @@ async fn acp_steering_starts_injects_or_defers() {
         .as_str()
         .unwrap()
         .to_string();
+    drain_advertisement(&mut client).await;
     client
         .send(
             &json!({"jsonrpc": "2.0", "id": 3, "method": "_session/steering",
@@ -1136,6 +1166,19 @@ async fn acp_concurrent_prompts_each_settle() {
     client.shutdown().await;
 }
 
+/// Consume the `available_commands_update` trailing a session/new (or
+/// resume/load/fork) result, asserting it arrives immediately after.
+/// Returns the frame for content assertions.
+async fn drain_advertisement(client: &mut AcpClient) -> Value {
+    let update = client.recv().await;
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        json!("available_commands_update"),
+        "advertisement trails the result: {update}"
+    );
+    update
+}
+
 /// Initialize (v2) + open a session; returns the ACP session id.
 async fn v2_session(client: &mut AcpClient, cwd: &std::path::Path) -> String {
     client
@@ -1148,10 +1191,12 @@ async fn v2_session(client: &mut AcpClient, cwd: &std::path::Path) -> String {
             "params": {"cwd": cwd.to_string_lossy()}}))
         .await;
     let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
-    frames.last().unwrap()["result"]["sessionId"]
+    let sid = frames.last().unwrap()["result"]["sessionId"]
         .as_str()
         .unwrap()
-        .to_string()
+        .to_string();
+    drain_advertisement(client).await;
+    sid
 }
 
 /// Initialize (v1) + open a session; returns the ACP session id.
@@ -1166,10 +1211,12 @@ async fn v1_session(client: &mut AcpClient, cwd: &std::path::Path) -> String {
             "params": {"cwd": cwd.to_string_lossy()}}))
         .await;
     let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
-    frames.last().unwrap()["result"]["sessionId"]
+    let sid = frames.last().unwrap()["result"]["sessionId"]
         .as_str()
         .unwrap()
-        .to_string()
+        .to_string();
+    drain_advertisement(client).await;
+    sid
 }
 
 #[tokio::test]
@@ -1933,6 +1980,7 @@ async fn acp_approval_mode_mismatch_adopts_loudly() {
         json!(adopted)
     );
     let acp_sid = created["result"]["sessionId"].as_str().unwrap();
+    drain_advertisement(&mut client).await;
     client
         .send(
             &json!({"jsonrpc": "2.0", "id": 3, "method": "session/close",
@@ -2241,6 +2289,7 @@ async fn acp_fork_fingerprint_resolves_occurrence_and_rejects() {
         .await;
     let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
     assert!(frames.last().unwrap().get("result").is_some(), "{frames:?}");
+    drain_advertisement(&mut client).await;
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(log_text.contains("cut=turn-2"), "{log_text}");
     // Occurrence past the duplicates, unmatched, and malformed points fail.
@@ -2464,9 +2513,9 @@ async fn acp_dynamic_skills_advertise_and_normalize() {
         .as_str()
         .unwrap()
         .to_string();
-    let commands = frames
-        .iter()
-        .find_map(|f| f["params"]["update"]["availableCommands"].as_array())
+    let advertised = drain_advertisement(&mut client).await;
+    let commands = advertised["params"]["update"]["availableCommands"]
+        .as_array()
         .expect("available_commands_update frame");
     let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
     for want in ["fake-skill", "other-skill", "skill", "help", "status"] {
@@ -3078,5 +3127,678 @@ async fn acp_goal_and_tasks_cards_render_folded_facts() {
         status.contains("- Goal: Ship the fake feature"),
         "status goal line: {status}"
     );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_model_children_stream_as_tool_blocks_and_cards() {
+    // A turn that spawns a subagent + workflow: the observer retains both,
+    // streams each as its own `tool_call` block (TUI-style), and the
+    // /subagents + /workflows cards read the retention.
+    let cwd = unique_dir("childrencwd");
+    let mut client = AcpClient::connect(HashMap::from([(
+        "FAKE_SCENARIO",
+        "turn-children".to_string(),
+    )]))
+    .await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    let tool_blocks = |frames: &[Value]| -> Vec<(String, String, String)> {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "tool_call")
+            .map(|f| {
+                let update = &f["params"]["update"];
+                (
+                    update["toolCallId"].as_str().unwrap_or("").to_string(),
+                    update["title"].as_str().unwrap_or("").to_string(),
+                    update["status"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    };
+
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": [{"type": "text", "text": "go"}]}}),
+        )
+        .await;
+    let mut seen = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        seen.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    // The observer folds asynchronously; poll the cards (collecting every
+    // frame) until retention lands.
+    let mut next_id = 4;
+    let mut poll_card = async |slash: &str, want: &str| -> String {
+        let mut card = String::new();
+        for _ in 0..50 {
+            client
+                .send(
+                    &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+                    "params": {"sessionId": acp_sid, "prompt": [slash]}}),
+                )
+                .await;
+            let frames = client
+                .recv_until(|f| f.get("id") == Some(&json!(next_id)))
+                .await;
+            next_id += 1;
+            assert_eq!(
+                frames.last().unwrap()["result"],
+                json!({"stopReason": "end_turn"}),
+                "{slash} settles inline"
+            );
+            card = card_of(&frames);
+            seen.extend(frames);
+            if card.contains(want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        card
+    };
+    let subagents = poll_card("/subagents", "Explore the schema").await;
+    for want in ["**Subagents**", "- [x] Explore the schema"] {
+        assert!(
+            subagents.contains(want),
+            "/subagents has {want}: {subagents}"
+        );
+    }
+    let workflows = poll_card("/workflows", "research").await;
+    for want in ["**Workflows**", "- [x] research (2/2 children"] {
+        assert!(
+            workflows.contains(want),
+            "/workflows has {want}: {workflows}"
+        );
+    }
+    // Both children streamed as their own blocks with mapped statuses.
+    let blocks = tool_blocks(&seen);
+    for (id, title) in [("child-1", "Explore the schema"), ("wf-1", "research")] {
+        for status in ["in_progress", "completed"] {
+            assert!(
+                blocks
+                    .iter()
+                    .any(|(i, t, s)| i == id && t == title && s == status),
+                "{id}/{title} streams {status}: {blocks:?}"
+            );
+        }
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_subagent_verbs_execute_and_report() {
+    // Verbs resolve targets, call the `subagent/*` methods with the durable
+    // id, and report admission; user errors return cards, never host calls.
+    let log = unique_dir("verbs").join("fake.log");
+    let cwd = unique_dir("verbscwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-children".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": [{"type": "text", "text": "go"}]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    // The observer folds asynchronously; wait for retention first so every
+    // verb below resolves deterministically (no elicitation surface here).
+    let mut next_id = 4;
+    let mut run_slash = async |slash: &str| -> String {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+                "params": {"sessionId": acp_sid, "prompt": [slash]}}),
+            )
+            .await;
+        let frames = client
+            .recv_until(|f| f.get("id") == Some(&json!(next_id)))
+            .await;
+        next_id += 1;
+        assert_eq!(
+            frames.last().unwrap()["result"],
+            json!({"stopReason": "end_turn"}),
+            "{slash} settles inline"
+        );
+        card_of(&frames)
+    };
+    let mut card = String::new();
+    for _ in 0..50 {
+        card = run_slash("/subagents").await;
+        if card.contains("Explore the schema") && card.contains("Write the migration") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        card.contains("Explore the schema") && card.contains("Write the migration"),
+        "retention lands: {card}"
+    );
+    let log_text = || std::fs::read_to_string(&log).unwrap_or_default();
+
+    let stop = run_slash("/subagents stop child-1").await;
+    assert!(
+        stop.contains("Stop requested for 'Explore the schema' (accepted)"),
+        "{stop}"
+    );
+    assert!(
+        log_text().contains("subagent/stop") && log_text().contains("sub=sa-1"),
+        "stop targets the durable id: {}",
+        log_text()
+    );
+    // Aliases + durable-id prefixes resolve the same row.
+    let kill = run_slash("/subagents kill sa-2").await;
+    assert!(
+        kill.contains("Stop requested for 'Write the migration'"),
+        "{kill}"
+    );
+    let note = run_slash("/subagents message child-2 hurry up").await;
+    assert!(
+        note.contains("Note queued for 'Write the migration' (accepted)"),
+        "{note}"
+    );
+    assert!(
+        log_text().contains("subagent/sendMessage") && log_text().contains("sub=sa-2"),
+        "message targets the durable id: {}",
+        log_text()
+    );
+    // Retained results render without consuming (no host call).
+    let result = run_slash("/subagents result child-1").await;
+    for want in [
+        "**Result: Explore the schema**",
+        "schema mapped",
+        "tables: users, orders",
+    ] {
+        assert!(result.contains(want), "{want}: {result}");
+    }
+    assert!(
+        !log_text().contains("subagent/readResult"),
+        "retained results render locally: {}",
+        log_text()
+    );
+    // Nothing retained: consume, and the content streams into the block.
+    let pending = run_slash("/subagents result child-2").await;
+    assert!(
+        pending.contains("Result requested for 'Write the migration' (accepted)"),
+        "{pending}"
+    );
+    assert!(
+        log_text().contains("subagent/readResult") && log_text().contains("sub=sa-2"),
+        "missing results consume: {}",
+        log_text()
+    );
+    // User errors stay cards (unknown verb/target, workflow target, body).
+    let usage = run_slash("/subagents frobnicate").await;
+    assert!(usage.contains("Subagents verbs"), "{usage}");
+    let miss = run_slash("/subagents stop zzz").await;
+    assert!(miss.contains("No subagent matches 'zzz'"), "{miss}");
+    let flow = run_slash("/subagents stop wf-1").await;
+    assert!(flow.contains("workflows have no control methods"), "{flow}");
+    let bodyless = run_slash("/subagents message child-2").await;
+    assert!(bodyless.contains("needs message text"), "{bodyless}");
+    let workflows = run_slash("/workflows foo").await;
+    assert!(workflows.contains("display-only"), "{workflows}");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_subagent_verbs_offer_pickers() {
+    // With a form surface, missing targets (and bodies) pop elicitation
+    // selects instead of failing: select-only, and select+text in one form.
+    let log = unique_dir("verbpick").join("fake.log");
+    let cwd = unique_dir("verbpickcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-children".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}}}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drain_advertisement(&mut client).await;
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": [{"type": "text", "text": "go"}]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    // Wait for retention (bare cards never elicit).
+    let mut next_id = 4;
+    for _ in 0..50 {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+                "params": {"sessionId": acp_sid, "prompt": ["/subagents"]}}),
+            )
+            .await;
+        let frames = client
+            .recv_until(|f| f.get("id") == Some(&json!(next_id)))
+            .await;
+        next_id += 1;
+        if card_of(&frames).contains("Write the migration") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Run one verb, answering every elicitation with `answer`, and return
+    // the card plus the elicitation params seen.
+    let mut run_verb = async |slash: &str, answer: Value| -> (String, Vec<Value>) {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+                "params": {"sessionId": acp_sid, "prompt": [slash]}}),
+            )
+            .await;
+        let mut frames = Vec::new();
+        let mut elicited = Vec::new();
+        loop {
+            let frame = client.recv().await;
+            if frame["method"].as_str() == Some("elicitation/create") {
+                elicited.push(frame["params"].clone());
+                client
+                    .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                        "result": {"action": "accept", "content": answer}}))
+                    .await;
+                continue;
+            }
+            let done = frame.get("id") == Some(&json!(next_id));
+            frames.push(frame);
+            if done {
+                break;
+            }
+        }
+        next_id += 1;
+        assert_eq!(
+            frames.last().unwrap()["result"],
+            json!({"stopReason": "end_turn"}),
+            "{slash} settles inline"
+        );
+        (card_of(&frames), elicited)
+    };
+    // Target-less `stop`: a select over both children with status marks.
+    let (card, elicited) = run_verb(
+        "/subagents stop",
+        json!({"choice": "[~] Write the migration (child-2)"}),
+    )
+    .await;
+    assert_eq!(elicited.len(), 1);
+    let labels = elicited[0]["requestedSchema"]["properties"]["choice"]["enum"]
+        .as_array()
+        .expect("choice enum");
+    assert!(
+        labels.contains(&json!("[x] Explore the schema (child-1)"))
+            && labels.contains(&json!("[~] Write the migration (child-2)")),
+        "picker lists both children: {labels:?}"
+    );
+    assert!(
+        card.contains("Stop requested for 'Write the migration' (accepted)"),
+        "{card}"
+    );
+    // Target-less `message`: select + text in a single form.
+    let (card, elicited) = run_verb(
+        "/subagents message",
+        json!({"choice": "[x] Explore the schema (child-1)", "text": "well done"}),
+    )
+    .await;
+    assert_eq!(elicited.len(), 1);
+    let props = &elicited[0]["requestedSchema"]["properties"];
+    assert!(props.get("choice").is_some() && props.get("text").is_some());
+    assert_eq!(props["text"]["type"], json!("string"));
+    assert!(
+        card.contains("Note queued for 'Explore the schema' (accepted)"),
+        "{card}"
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("subagent/stop") && log_text.contains("sub=sa-2"),
+        "picked stop lands: {log_text}"
+    );
+    assert!(
+        log_text.contains("subagent/sendMessage") && log_text.contains("sub=sa-1"),
+        "picked message lands: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_set_mode_switches_approval_posture() {
+    // `session/set_mode` drives the switch and fails closed on unknown
+    // modes/sessions (clients revert optimistic updates on error).
+    let log = unique_dir("setmode").join("fake.log");
+    let cwd = unique_dir("setmodecwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+    for (id, mode) in [(3, "auto"), (4, "deny"), (5, "ask")] {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": id, "method": "session/set_mode",
+                "params": {"sessionId": acp_sid, "modeId": mode}}),
+            )
+            .await;
+        let reply = client.recv().await;
+        assert!(reply.get("result").is_some(), "{mode} switches: {reply}");
+    }
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 6, "method": "session/set_mode",
+            "params": {"sessionId": acp_sid, "modeId": "frenzied"}}),
+        )
+        .await;
+    assert_eq!(client.recv().await["error"]["code"], json!(-32602));
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 7, "method": "session/set_mode",
+            "params": {"sessionId": "acp-nope", "modeId": "auto"}}),
+        )
+        .await;
+    assert_eq!(client.recv().await["error"]["code"], json!(-32602));
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    for want in [
+        "session/setApprovalMode",
+        "mode=allowAll",
+        "mode=denyUnmatched",
+        "mode=promptUnmatched",
+    ] {
+        assert!(log_text.contains(want), "host saw {want}: {log_text}");
+    }
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_yolo_declines_questions_without_interrupting() {
+    // Yolo rides host allowAll and auto-declines user questions — even
+    // when the client advertised a form surface. The turn still settles
+    // end_turn; the host proceeds without answers.
+    let log = unique_dir("yoloq").join("fake.log");
+    let cwd = unique_dir("yoloqcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-userinput-form".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}}}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drain_advertisement(&mut client).await;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_mode",
+            "params": {"sessionId": acp_sid, "modeId": "yolo"}}),
+        )
+        .await;
+    assert!(client.recv().await.get("result").is_some(), "yolo switches");
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["ask me later"]}}),
+        )
+        .await;
+    let mut saw_form = false;
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("elicitation/create") {
+            saw_form = true;
+        }
+        if frame.get("id") == Some(&json!(4)) {
+            assert_eq!(
+                frame["result"],
+                json!({"stopReason": "end_turn"}),
+                "the turn survives unanswered questions"
+            );
+            break;
+        }
+    }
+    assert!(!saw_form, "yolo never surfaces questions");
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("userInput/cancel"),
+        "yolo declines at the host: {log_text}"
+    );
+    assert!(
+        log_text.contains("mode=allowAll"),
+        "yolo rides allowAll: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_yolo_label_survives_matching_resume() {
+    // The host only knows allowAll; resume must not degrade the yolo
+    // label when the folded posture matches.
+    let cwd = unique_dir("yoloresumecwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_MODE", "allowAll".to_string());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/set_mode",
+            "params": {"sessionId": acp_sid, "modeId": "yolo"}}),
+        )
+        .await;
+    assert!(client.recv().await.get("result").is_some());
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/resume",
+            "params": {"sessionId": acp_sid}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(4))).await;
+    let resumed = frames.last().expect("resume reply");
+    assert_eq!(
+        resumed["result"]["modes"]["currentModeId"],
+        json!("yolo"),
+        "resume keeps yolo: {resumed}"
+    );
+    assert_eq!(
+        resumed["result"]["configOptions"][0]["currentValue"],
+        json!("yolo")
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_model_and_effort_commands_offer_picker_forms() {
+    // Bare `/models` and invalid `/effort` pop single-select
+    // elicitation forms when the client has a form surface.
+    let log = unique_dir("pickform").join("fake.log");
+    let cwd = unique_dir("pickformcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}}}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drain_advertisement(&mut client).await;
+
+    // Bare `/models` → form offering the catalog → accept switches.
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/models"]}}),
+        )
+        .await;
+    let mut card = String::new();
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("elicitation/create") {
+            let options = frame["params"]["requestedSchema"]["properties"]["choice"]["enum"]
+                .as_array()
+                .expect("choice enum");
+            assert!(
+                options.iter().any(|o| o == "fake-a"),
+                "form offers the catalog: {frame:?}"
+            );
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"action": "accept",
+                        "content": {"choice": "fake-a"}}}))
+                .await;
+            continue;
+        }
+        if frame.get("id") == Some(&json!(3)) {
+            assert_eq!(frame["result"], json!({"stopReason": "end_turn"}));
+            break;
+        }
+        if frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk" {
+            card.push_str(
+                frame["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or(""),
+            );
+        }
+    }
+    assert!(card.contains("Model set to fake-a"), "switch card: {card}");
+
+    // Invalid `/effort` → form offering the tiers → accept switches.
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/effort bogus"]}}),
+        )
+        .await;
+    let mut card = String::new();
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("elicitation/create") {
+            let options = frame["params"]["requestedSchema"]["properties"]["choice"]["enum"]
+                .as_array()
+                .expect("choice enum");
+            assert_eq!(options.len(), 8, "form offers all tiers");
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"action": "accept",
+                        "content": {"choice": "ultra"}}}))
+                .await;
+            continue;
+        }
+        if frame.get("id") == Some(&json!(4)) {
+            assert_eq!(frame["result"], json!({"stopReason": "end_turn"}));
+            break;
+        }
+        if frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk" {
+            card.push_str(
+                frame["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap_or(""),
+            );
+        }
+    }
+    assert!(
+        card.contains("Reasoning effort set to ultra"),
+        "effort card: {card}"
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(log_text.contains("session/setModel"), "{log_text}");
+    assert!(
+        log_text.contains("session/setReasoningEffort"),
+        "{log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_model_and_effort_commands_fall_back_to_cards() {
+    // Without a form surface, bare `/models` and `/effort` render
+    // their cards (no memorization required either way).
+    let cwd = unique_dir("pickcardcwd");
+    let mut client =
+        AcpClient::connect(HashMap::from([("FAKE_SCENARIO", "serve".to_string())])).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/models"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    let card = card_of(&frames);
+    assert!(card.contains("**Models**"), "{card}");
+    assert!(card.contains("fake-a"), "{card}");
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/effort"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(4))).await;
+    let card = card_of(&frames);
+    assert!(card.contains("Reasoning effort:"), "{card}");
     client.shutdown().await;
 }

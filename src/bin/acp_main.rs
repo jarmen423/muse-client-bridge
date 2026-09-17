@@ -8,7 +8,7 @@
 //!
 //! Configuration is env-only (the arg surface belongs to the installer):
 //! `MUSE_CLI`, `MUSE_SERVE_ARGS`, `MUSE_APPROVAL_MODE` (per-session posture,
-//! `ask|auto|deny` or a host mode), `MUSE_TRUST_WORKSPACE=1` (passthrough),
+//! `ask|auto|yolo|deny` or a host mode), `MUSE_TRUST_WORKSPACE=1` (passthrough),
 //! `MUSE_COMMAND_TIMEOUT_MS`, `RUST_LOG`.
 
 use std::process::ExitCode;

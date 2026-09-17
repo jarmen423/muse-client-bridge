@@ -164,10 +164,19 @@ async fn v1_session(client: &mut AcpClient, cwd: &std::path::Path) -> String {
             "params": {"cwd": cwd.to_string_lossy()}}))
         .await;
     let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
-    frames.last().unwrap()["result"]["sessionId"]
+    let sid = frames.last().unwrap()["result"]["sessionId"]
         .as_str()
         .unwrap()
-        .to_string()
+        .to_string();
+    // The advertisement trails the result; consume it so prompt-phase
+    // windows start clean.
+    let update = client.recv().await;
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        json!("available_commands_update"),
+        "advertisement trails the result: {update}"
+    );
+    sid
 }
 
 #[tokio::test]
@@ -287,6 +296,12 @@ async fn golden_v2_prompt_frames() {
         .as_str()
         .unwrap()
         .to_string();
+    let update = client.recv().await;
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        json!("available_commands_update"),
+        "advertisement trails the result: {update}"
+    );
     client
         .send(
             &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
@@ -358,13 +373,15 @@ async fn golden_tool_call_replay() {
         .collect();
     assert_eq!(
         updates,
-        vec![
-            "user_message_chunk",
-            "agent_message_chunk",
-            "tool_call",
-            "available_commands_update"
-        ],
-        "{frames:?}"
+        vec!["user_message_chunk", "agent_message_chunk", "tool_call",],
+        "replay precedes the result: {frames:?}"
+    );
+    // The advertisement trails the result instead.
+    let update = client.recv().await;
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        json!("available_commands_update"),
+        "advertisement trails the result: {update}"
     );
     let tool = frames
         .iter()
@@ -512,117 +529,6 @@ const GOLDEN_INITIALIZE_V2: &str = r#"
 "#;
 const GOLDEN_SESSION_NEW_V1: &str = r#"[
   {
-    "jsonrpc": "2.0",
-    "method": "session/update",
-    "params": {
-      "sessionId": "<acp-sid>",
-      "update": {
-        "availableCommands": [
-          {
-            "description": "Compact the session context",
-            "name": "compact"
-          },
-          {
-            "description": "Show available commands and gestures",
-            "name": "help"
-          },
-          {
-            "description": "Show session, model, and host status",
-            "name": "status"
-          },
-          {
-            "description": "Show token and context-window usage",
-            "name": "usage"
-          },
-          {
-            "description": "Show or set the durable session name",
-            "input": {
-              "hint": "new name"
-            },
-            "name": "name"
-          },
-          {
-            "description": "List models; `/model <id>` switches",
-            "input": {
-              "hint": "model id"
-            },
-            "name": "models"
-          },
-          {
-            "description": "Show or set the reasoning effort",
-            "input": {
-              "hint": "tier"
-            },
-            "name": "effort"
-          },
-          {
-            "description": "Show a recap of recent session activity",
-            "name": "recap"
-          },
-          {
-            "description": "Stop the in-flight turn",
-            "name": "stop"
-          },
-          {
-            "description": "Show the session goal",
-            "name": "goal"
-          },
-          {
-            "description": "Show the session task list",
-            "name": "tasks"
-          },
-          {
-            "description": "Close this session",
-            "name": "exit"
-          },
-          {
-            "description": "Invoke a Muse skill",
-            "input": {
-              "hint": "skill id and optional prompt"
-            },
-            "name": "skill"
-          },
-          {
-            "description": "Create a grounded plan and stop for approval",
-            "input": {
-              "hint": "what to plan"
-            },
-            "name": "plan"
-          },
-          {
-            "description": "Diagnose a Muse runtime or session issue",
-            "input": {
-              "hint": "symptom or session"
-            },
-            "name": "doctor"
-          },
-          {
-            "description": "Create a Muse skill",
-            "input": {
-              "hint": "what the skill should do"
-            },
-            "name": "create-skill"
-          },
-          {
-            "description": "Create a Muse plugin",
-            "input": {
-              "hint": "what the plugin should do"
-            },
-            "name": "create-plugin"
-          },
-          {
-            "description": "Import another agent's session",
-            "input": {
-              "hint": "transcript, path, or session id"
-            },
-            "name": "import"
-          }
-        ],
-        "sessionUpdate": "available_commands_update"
-      }
-    }
-  },
-  {
     "id": 2,
     "jsonrpc": "2.0",
     "result": {
@@ -646,6 +552,11 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"[
               "description": "Allow all tools without asking",
               "name": "Auto",
               "value": "auto"
+            },
+            {
+              "description": "Allow all tools and skip questions",
+              "name": "Yolo",
+              "value": "yolo"
             },
             {
               "description": "Deny unmatched tools",
@@ -724,6 +635,11 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"[
             "name": "Auto"
           },
           {
+            "description": "Allow all tools and skip questions",
+            "id": "yolo",
+            "name": "Yolo"
+          },
+          {
             "description": "Deny unmatched tools",
             "id": "deny",
             "name": "Deny"
@@ -736,126 +652,6 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"[
   }
 ]"#;
 const GOLDEN_SESSION_NEW_V2: &str = r#"[
-  {
-    "jsonrpc": "2.0",
-    "method": "session/update",
-    "params": {
-      "sessionId": "<acp-sid>",
-      "update": {
-        "availableCommands": [
-          {
-            "description": "Compact the session context",
-            "name": "compact"
-          },
-          {
-            "description": "Show available commands and gestures",
-            "name": "help"
-          },
-          {
-            "description": "Show session, model, and host status",
-            "name": "status"
-          },
-          {
-            "description": "Show token and context-window usage",
-            "name": "usage"
-          },
-          {
-            "description": "Show or set the durable session name",
-            "input": {
-              "hint": "new name",
-              "type": "text"
-            },
-            "name": "name"
-          },
-          {
-            "description": "List models; `/model <id>` switches",
-            "input": {
-              "hint": "model id",
-              "type": "text"
-            },
-            "name": "models"
-          },
-          {
-            "description": "Show or set the reasoning effort",
-            "input": {
-              "hint": "tier",
-              "type": "text"
-            },
-            "name": "effort"
-          },
-          {
-            "description": "Show a recap of recent session activity",
-            "name": "recap"
-          },
-          {
-            "description": "Stop the in-flight turn",
-            "name": "stop"
-          },
-          {
-            "description": "Show the session goal",
-            "name": "goal"
-          },
-          {
-            "description": "Show the session task list",
-            "name": "tasks"
-          },
-          {
-            "description": "Close this session",
-            "name": "exit"
-          },
-          {
-            "description": "Invoke a Muse skill",
-            "input": {
-              "hint": "skill id and optional prompt",
-              "type": "text"
-            },
-            "name": "skill"
-          },
-          {
-            "description": "Create a grounded plan and stop for approval",
-            "input": {
-              "hint": "what to plan",
-              "type": "text"
-            },
-            "name": "plan"
-          },
-          {
-            "description": "Diagnose a Muse runtime or session issue",
-            "input": {
-              "hint": "symptom or session",
-              "type": "text"
-            },
-            "name": "doctor"
-          },
-          {
-            "description": "Create a Muse skill",
-            "input": {
-              "hint": "what the skill should do",
-              "type": "text"
-            },
-            "name": "create-skill"
-          },
-          {
-            "description": "Create a Muse plugin",
-            "input": {
-              "hint": "what the plugin should do",
-              "type": "text"
-            },
-            "name": "create-plugin"
-          },
-          {
-            "description": "Import another agent's session",
-            "input": {
-              "hint": "transcript, path, or session id",
-              "type": "text"
-            },
-            "name": "import"
-          }
-        ],
-        "sessionUpdate": "available_commands_update"
-      }
-    }
-  },
   {
     "id": 2,
     "jsonrpc": "2.0",
@@ -880,6 +676,11 @@ const GOLDEN_SESSION_NEW_V2: &str = r#"[
               "description": "Allow all tools without asking",
               "name": "Auto",
               "value": "auto"
+            },
+            {
+              "description": "Allow all tools and skip questions",
+              "name": "Yolo",
+              "value": "yolo"
             },
             {
               "description": "Deny unmatched tools",
@@ -1173,6 +974,11 @@ const GOLDEN_CONFIG_OPTIONS_V1: &str = r#"
         "value": "auto"
       },
       {
+        "description": "Allow all tools and skip questions",
+        "name": "Yolo",
+        "value": "yolo"
+      },
+      {
         "description": "Deny unmatched tools",
         "name": "Deny",
         "value": "deny"
@@ -1257,6 +1063,11 @@ const GOLDEN_CONFIG_OPTIONS_V2: &str = r#"
         "value": "auto"
       },
       {
+        "description": "Allow all tools and skip questions",
+        "name": "Yolo",
+        "value": "yolo"
+      },
+      {
         "description": "Deny unmatched tools",
         "name": "Deny",
         "value": "deny"
@@ -1333,6 +1144,11 @@ const GOLDEN_SESSION_MODES: &str = r#"
       "description": "Allow all tools without asking",
       "id": "auto",
       "name": "Auto"
+    },
+    {
+      "description": "Allow all tools and skip questions",
+      "id": "yolo",
+      "name": "Yolo"
     },
     {
       "description": "Deny unmatched tools",

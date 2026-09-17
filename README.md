@@ -152,17 +152,32 @@ spawns it per session, so there are no ports and no HTTP involved.
 Notes:
 
 - **Approval mode is switchable in the Zed UI.** The agent panel's
-  Session Mode picker (Ask/Auto/Deny, plus model and reasoning-effort
-  pickers) calls straight through to the host mid-session, so
-  `MUSE_APPROVAL_MODE` only sets the *starting* posture — bogus
-  values fail loudly. Under `ask`, host approvals surface as Zed's
-  permission dialog and host questions as elicitation forms; a client
-  without those surfaces still fails closed (deny/cancel), never
-  auto-approves.
+  Session Mode picker (Ask/Auto/Yolo/Deny, plus model and
+  reasoning-effort pickers) calls straight through to the host
+  mid-session, so `MUSE_APPROVAL_MODE` only sets the *starting*
+  posture — bogus values fail loudly. Yolo rides host `allowAll`
+  and auto-declines user questions (never interrupts); it never
+  auto-approves host approval requests (under `allowAll` the host
+  sends none — any that arrive still surface). Bare `/models` and
+  `/effort` (or an invalid tier) pop a selection form when the
+  client has an elicitation surface, else a card. Under `ask`, host
+  approvals surface as Zed's permission dialog and host questions
+  as elicitation forms; a client without those surfaces still
+  fails closed (deny/cancel), never auto-approves.
+- **Import sessions works.** `session/list` merges live sessions
+  with durable host sessions (past TUI/CLI runs), each with title
+  and last-activity time, and every entry loads via `session/load`
+  with history replay — Zed's importer just works.
 - **Slash commands:** the advertised list is live — protocol
   commands (`/help /status /usage /name /models /effort /recap
-  /stop /goal /tasks /compact /exit`) plus every skill `muse skills
-  list` reports for the workspace. `/<id>` maps to Muse's `/skill`
+  /stop /goal /tasks /subagents /workflows /compact /exit`) plus
+  every skill `muse skills list` reports for the workspace.
+  Model-spawned children also stream as their own `tool_call`
+  blocks (spawn → progress → terminal), TUI-style, and
+  `/subagents <verb> [target] [text]` controls them (stop,
+  interrupt, close, resume, reopen, message, followup, result —
+  missing targets pop a selector, message bodies a text field).
+  `/<id>` maps to Muse's `/skill`
   grammar; protocol commands settle locally and never start a turn.
   A leading space escapes execution (` /plan` stays literal text).
 - **Client MCP servers** (`session/new` `mcpServers`) forward into
