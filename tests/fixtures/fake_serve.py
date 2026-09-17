@@ -10,7 +10,7 @@ stay parallel-safe):
                   | fail:<method>:<kind>:<code> | die:<code> | probe-unknown
                   | garbage | turn-happy | turn-approval
                   | turn-approval-all-approve | turn-approval-no-id
-                  | turn-userinput | turn-gap | turn-failed | turn-tool-slow
+                  | turn-userinput | turn-userinput-form | turn-gap | turn-failed | turn-tool-slow
                   | turn-tool | turn-reasoning | turn-reasoning-quiet
                   | turn-unqueued | turn-retracted | turn-retract-then-completed
                   | turn-retry-then-completed | turn-queued
@@ -100,7 +100,7 @@ elif SCENARIO != "serve":
     sys.stderr.write(f"fake_serve: unknown scenario {SCENARIO!r}\n")
     sys.exit(2)
 if TURN_SCRIPT not in (None, "turn-happy", "turn-approval", "turn-approval-all-approve",
-                       "turn-approval-no-id", "turn-userinput", "turn-gap",
+                       "turn-approval-no-id", "turn-userinput", "turn-userinput-form", "turn-gap",
                        "turn-failed", "turn-tool-slow", "turn-tool",
                        "turn-reasoning", "turn-reasoning-quiet", "turn-unqueued",
                        "turn-retracted", "turn-retract-then-completed",
@@ -154,6 +154,12 @@ def log_method(method, params):
         detail = f" src={params.get('sessionId', '-')} cut={(params.get('cutPoint') or {}).get('lastTurnId', '<all>')}"
     elif method == "session/compact":
         detail = f" sid={params.get('sessionId', '-')}"
+    elif method == "session/rename":
+        detail = f" name={params.get('name', '-')}"
+    elif method == "session/setReasoningEffort":
+        detail = f" effort={params.get('reasoningEffort', '-')}"
+    elif method == "userInput/answer":
+        detail = f" ui={params.get('userInputId', '-')} answers={params.get('answers', '-')}"
     elif method == "turn/steer":
         detail = f" expected={params.get('expectedTurnId', '-')}"
     elif method == "turn/unqueue":
@@ -317,7 +323,23 @@ def answer(method, req_id, params):
         host_only["updatedAt"] = "2026-09-15T00:00:00Z"
         return {"result": {"sessions": [listed, host_only]}}
     if method == "session/read":
-        return {"result": {"history": {"mode": "inline", "items": history_items()}}}
+        return {"result": {
+            "session": session_obj(),
+            "history": {"mode": "inline", "items": history_items()},
+            "pendingRequests": [],
+        }}
+    if method == "session/rename":
+        return {"result": {
+            "commandId": params.get("commandId", ""),
+            "status": "accepted",
+            "name": params.get("name", ""),
+        }}
+    if method == "session/setReasoningEffort":
+        return {"result": {
+            "commandId": params.get("commandId", ""),
+            "status": "accepted",
+            "reasoningEffort": params.get("reasoningEffort", ""),
+        }}
     if method == "session/fork":
         forked = dict(session_obj())
         forked["sessionId"] = "fake-sess-fork"
@@ -521,6 +543,24 @@ def play_script(turn_id):
                 "timeoutMs": 5000,
             },
         })
+    elif TURN_SCRIPT == "turn-userinput-form":
+        notify("turn/started", {"turnId": turn_id})
+        PENDING["turn"] = turn_id
+        send({
+            "jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
+            "params": {
+                "sessionId": MSP_SID, "viewCursor": next_cursor(),
+                "userInputId": "ui-1",
+                "questions": [{
+                    "id": "color", "header": "Pick",
+                    "question": "Which color?",
+                    "options": [{"label": "red"}, {"label": "red"},
+                                {"label": "blue"}],
+                    "selection": {"mode": "single"},
+                }],
+                "timeoutMs": 5000,
+            },
+        })
     elif TURN_SCRIPT == "turn-gap":
         notify("turn/started", {"turnId": turn_id})
         notify("item/started", {"item": agent_item("m1", turn_id, 1, "inProgress", "")})
@@ -610,7 +650,7 @@ def sendApproval(turn_id, all_approve, approval_id="ap-1"):
         "sessionId": MSP_SID, "viewCursor": next_cursor(),
         "currentRequirementId": {"approvalId": approval_id or "", "sourceIndex": 0},
         "toolName": "shell",
-        "subject": {"kind": "command", "text": "rm -rf /"},
+        "subject": {"kind": "shell", "command": "rm -rf /"},
         "availableChoices": choices,
         "isOutboundStale": False,
     }
@@ -824,7 +864,8 @@ def main():
             play_script(body["result"]["turnId"])
         elif TURN_SCRIPT is not None and method == "approval/decide" and PENDING["turn"]:
             on_decide(PENDING["turn"])
-        elif TURN_SCRIPT is not None and method == "userInput/cancel" and PENDING["turn"]:
+        elif TURN_SCRIPT is not None and method in ("userInput/cancel", "userInput/answer") \
+                and PENDING["turn"]:
             on_userinput_cancel(PENDING["turn"])
         elif TURN_SCRIPT is not None and method == "turn/cancel":
             on_turn_cancel(params_dict.get("turnId"))

@@ -1,5 +1,10 @@
 # FORK PLAN — ACP surface with full Muse CLI / MSP parity
 
+> **Status note (2026-09-16):** P4's fail-closed auto-deny was superseded by
+> TODO P9 — approvals now bridge to `session/request_permission` and user
+> input to `elicitation/create` (fail closed only when the client lacks the
+> surface). See TODO.md for the landed parity list.
+
 ## Goal
 
 Add a `muse-acp`-derived ACP server surface to `muse-bridge` so IDE clients

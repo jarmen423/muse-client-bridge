@@ -15,3 +15,4 @@ pub mod compat;
 pub mod errors;
 pub mod server;
 pub mod sessions;
+pub mod skills;

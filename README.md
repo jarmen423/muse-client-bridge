@@ -125,9 +125,10 @@ spawns it per session, so there are no ports and no HTTP involved.
 
    The bare default command is `muse-acp`, so pass `--command` with
    the absolute path (or a name on your `PATH`). `--env` entries land
-   in the entry's `"env"` object; `MUSE_APPROVAL_MODE=auto` lets the
-   agent run tools without approval round-trips (see below). Preview
-   with `--dry-run`; remove with `muse-acp-bridge uninstall`.
+   in the entry's `"env"` object; `MUSE_APPROVAL_MODE=auto` sets the
+   starting posture (switchable later in the agent panel — see
+   below). Preview with `--dry-run`; remove with
+   `muse-acp-bridge uninstall`.
 
    This writes (entry name defaults to `muse-acp`):
 
@@ -150,22 +151,65 @@ spawns it per session, so there are no ports and no HTTP involved.
 
 Notes:
 
-- **Approval posture:** `MUSE_APPROVAL_MODE=ask|auto|deny` (default
-  `ask`, i.e. `promptUnmatched`) or a host mode — bogus values fail
-  loudly. The bridge has no permission UI: approval prompts are
-  auto-denied (fail closed) and user-input dialogs auto-cancelled, so
-  under `ask` tool-heavy turns stall on denials. Use `auto` unless
-  you are testing denials.
+- **Approval mode is switchable in the Zed UI.** The agent panel's
+  Session Mode picker (Ask/Auto/Deny, plus model and reasoning-effort
+  pickers) calls straight through to the host mid-session, so
+  `MUSE_APPROVAL_MODE` only sets the *starting* posture — bogus
+  values fail loudly. Under `ask`, host approvals surface as Zed's
+  permission dialog and host questions as elicitation forms; a client
+  without those surfaces still fails closed (deny/cancel), never
+  auto-approves.
+- **Slash commands:** the advertised list is live — protocol
+  commands (`/help /status /usage /name /models /effort /recap
+  /compact /exit`) plus every skill `muse skills list` reports for
+  the workspace. `/<id>` maps to Muse's `/skill` grammar; protocol
+  commands settle locally and never start a turn. A leading space
+  escapes execution (` /plan` stays literal text).
 - **Sessions:** each Zed session gets its own MSP session rooted at
-  the folder you opened; closing the Zed session ends it.
+  the folder you opened; closing the Zed session ends it. Session
+  list, resume, and fork are all exposed to the client.
 - **Logs** go to the bridge's stderr, captured by Zed from the
   spawned process. Other env knobs (via `--env`): `MUSE_CLI`,
   `MUSE_SERVE_ARGS`, `MUSE_TRUST_WORKSPACE=1`,
   `MUSE_COMMAND_TIMEOUT_MS`, `RUST_LOG` (`debug` for content
   tracing).
+- **Alongside upstream `muse-acp`:** no need to uninstall it — the
+  binaries have different names and can't conflict at runtime. Both
+  installers default to the entry name `muse-acp`, so a default
+  install *replaces* that entry; pass `--name muse-acp-bridge` to
+  keep both and compare. Note upstream's `uninstall` removes
+  whatever sits under `muse-acp`.
 - **JetBrains IDEs:** `muse-acp-bridge install-intellij --command
   <absolute path>` (absolute path required) writes
   `~/.jetbrains/acp.json`.
+
+### Remote dev (Zed SSH)
+
+For a remote workspace the split is: **binary on the VM, config on
+your local machine.** Zed spawns the agent server on the remote host
+but reads `settings.json` locally.
+
+1. On the VM: install `muse-acp-bridge` (e.g.
+   `~/.local/bin/muse-acp-bridge`), install the `muse` CLI, and run
+   `muse login` there as the same user Zed SSHes in as.
+2. On your local machine: run the installer (any copy of the binary
+   — it only edits local settings) with the **remote** path, or
+   hand-edit `~/.config/zed/settings.json`:
+
+   ```sh
+   muse-acp-bridge install \
+     --command /home/you/.local/bin/muse-acp-bridge \
+     --env MUSE_APPROVAL_MODE=auto
+   ```
+
+   The installer doesn't validate the command for Zed entries, and
+   an absolute path sidesteps PATH issues entirely.
+3. Connect to the remote project and select the agent in the Agent
+   panel.
+
+If you work both locally and remotely with one settings file, register
+a second entry (`--name muse-acp-remote` with the VM path) and pick
+the right one per workspace.
 
 ## HTTP endpoints
 
@@ -206,7 +250,7 @@ accepted in any form and never inspected.
 | Empty/slow first byte | agent is working (tool calls stream as status text); watch `reasoning_content` / status lines. |
 | `muse: command not found` | bridge needs `muse` on `PATH`, or set `MUSE_CLI=/path/to/muse`. |
 | Zed agent fails to start / command not found | `"command"` isn't on Zed's `PATH`. Re-run install with `--command /abs/path/to/muse-acp-bridge`. |
-| Zed agent denies every tool action | default `ask` posture auto-denies (no permission UI). Set `"MUSE_APPROVAL_MODE": "auto"` in the entry's `env`, or reinstall with `--env MUSE_APPROVAL_MODE=auto`. |
+| Zed agent denies every tool action | `ask` posture shows a permission dialog per action — dismissed dialogs fail closed. Flip Session Mode to Auto in the agent panel, or set `"MUSE_APPROVAL_MODE": "auto"` in the entry's `env`. |
 | `muse login required` inside Zed | same as HTTP: run `muse login` as the same user Zed runs under. |
 
 `RUST_LOG=debug` enables content-level tracing (request/response

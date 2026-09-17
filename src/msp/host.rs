@@ -939,6 +939,13 @@ impl Supervisor {
         self.shared.inner.read().await.status.clone()
     }
 
+    /// The launch configuration (bin, serve args, env) — the skills
+    /// subprocess and diagnostics need the same binary/posture the host
+    /// runs with.
+    pub fn config(&self) -> &HostConfig {
+        &self.shared.config
+    }
+
     /// Latest connection (may be dead; check [`MspConnection::is_alive`]).
     /// Prefer [`ready`](Supervisor::ready) for request paths.
     pub async fn current(&self) -> Arc<MspConnection> {

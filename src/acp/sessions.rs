@@ -8,21 +8,28 @@
 //! `session/update` notifications until the turn settles.
 //!
 //! Implemented here: new/list/resume/load/fork/close, prompt (incl. the
-//! `/compact` protocol command), steering, mode/model/effort selectors, gap
-//! page+refold with lag catch-up, fail-closed approvals, auto-cancelled user
-//! input, and SPEC §6 error mapping. There is deliberately no permission
-//! forwarding or elicitation surface: like the headless HTTP bridge, ACP
-//! fails closed on approvals (first non-approving choice, else cancel) and
-//! auto-cancels user input, loudly logged with the durable id.
+//! protocol commands `/compact` `/help` `/status` `/usage` `/name` `/model`
+//! `/exit` `/effort` `/recap`), steering, mode/model/effort selectors, gap
+//! page+refold with lag catch-up, permission dialogs
+//! (`session/request_permission`), user questions (`elicitation/create`
+//! when the client advertises `elicitation.form`), dynamic skill commands
+//! (`muse skills list`), and SPEC §6 error mapping. Approvals and user
+//! input still fail closed without a client surface: a permission with no
+//! deny choice cancels the turn, and unadvertised user input auto-cancels —
+//! both loudly logged with the durable id.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, watch};
 
 use crate::acp::errors::AcpError;
-use crate::acp::server::{self, Outbound};
+use crate::acp::server::{self, ClientRequests, Outbound};
+use crate::acp::skills::{self, SkillEntry};
 use crate::dispatch::Dispatcher;
 use crate::msp::fold::{OutputEvent, TurnFold, TurnOutcome};
 use crate::msp::host::{HostEvent, HostState, MspConnection};
@@ -41,9 +48,13 @@ pub const APPROVAL_MODE_ENV: &str = "MUSE_APPROVAL_MODE";
 /// Cap for inlining local `resource_link` file text into a prompt (1 MiB;
 /// larger files degrade to a `[resource: …]` reference, never an error).
 const RESOURCE_TEXT_CAP_BYTES: u64 = 1024 * 1024;
-/// `userInput/cancel` reason: P4 has no elicitation surface, so user-input
-/// prompts auto-cancel (fail closed), loudly logged with the durable id.
+/// `userInput/cancel` reason when the client advertised no elicitation
+/// surface (fail closed), loudly logged with the durable id.
 const USER_INPUT_CANCEL_REASON: &str = "acp-fail-closed";
+/// `userInput/cancel` reason when an elicitation was declined/dismissed.
+const ELICITATION_DISMISSED_REASON: &str = "acp-elicitation-dismissed";
+/// `userInput/cancel` reason when the elicitation reply errored out.
+const ELICITATION_FAILED_REASON: &str = "acp-elicitation-failed";
 
 /// One in-flight ACP prompt: the MSP turn plus its reply routing.
 struct InFlight {
@@ -54,6 +65,72 @@ struct InFlight {
     req_id: Option<Value>,
     /// Cancel flag watched by the driver (set by `session/cancel`/`close`).
     cancel_tx: watch::Sender<bool>,
+}
+
+/// An MSP approval presented to the client as `session/request_permission`
+/// and awaiting the reply (ported from `muse-acp` `PendingPerm`).
+struct PendingPerm {
+    /// ACP request id awaiting the client reply.
+    req_id: Value,
+    /// MSP `approvalId` (the decide target).
+    approval_id: String,
+    /// `currentRequirementId` verbatim (the multi-stage race guard).
+    requirement: Value,
+    /// The turn a fail-closed settle cancels.
+    turn_id: String,
+    /// `(choiceId, decision)` in host order; first reject-ish is the deny
+    /// fallback.
+    choices: Vec<(String, String)>,
+}
+
+/// One elicitation question's label mapping (ported from `muse-acp`).
+struct UiQuestion {
+    /// Host question id (answers key on it).
+    qid: String,
+    /// Original host labels (sent back in `userInput/answer`).
+    labels: Vec<String>,
+    /// Deduped display labels (shown to the client in the enum).
+    display: Vec<String>,
+}
+
+/// An MSP `userInput` prompt presented as `elicitation/create` and awaiting
+/// the reply (ported from `muse-acp` `PendingUi`).
+struct PendingUi {
+    /// ACP request id awaiting the client reply.
+    req_id: Value,
+    /// MSP `userInputId` (the answer/cancel target).
+    user_input_id: String,
+    /// Question label mappings, in host order.
+    questions: Vec<UiQuestion>,
+}
+
+/// Session facts folded from session notifications (latest-wins; every
+/// field stays `None` until a fact lands). Feeds the `/status`, `/usage`,
+/// and `/recap` cards plus `plan`/`session_info_update`/`usage_update`
+/// bridges.
+#[derive(Default)]
+struct SessionFacts {
+    /// `session/nameChanged` / `session/rename` canonical name.
+    name: Option<String>,
+    /// `session/goalChanged` goal block (raw; `Null` is an explicit clear).
+    goal: Option<Value>,
+    /// `session/branchChanged` as the namespaced `{branch, vcs,
+    /// workspaceRoot}` observation (`branch: null` = detached).
+    branch: Option<Value>,
+    /// `session/todoListChanged` items (raw list, replace wholesale).
+    todos: Option<Vec<Value>>,
+    /// `session/tokenUsage` cumulative totals (replace wholesale).
+    cum_prompt: Option<u64>,
+    /// Output tokens, session total.
+    cum_output: Option<u64>,
+    /// Counted-once total, session total.
+    cum_total: Option<u64>,
+    /// `session/contextUsage` occupancy.
+    usage_used: Option<u64>,
+    /// `session/contextUsage` window.
+    usage_size: Option<u64>,
+    /// `session/contextUsage` pressure.
+    usage_pressure: Option<String>,
 }
 
 /// One ACP session: a persistent MSP session plus prompt state.
@@ -68,13 +145,29 @@ struct AcpSession {
     mode: String,
     /// Last selected model id (`""` ⇒ server default).
     model_value: String,
-    /// Reasoning effort sent with each prompt.
+    /// Reasoning effort sent with each prompt (the per-turn override the
+    /// selector owns; `session/setReasoningEffort` keeps the host default
+    /// in step so resumed sessions inherit it).
     reasoning_effort: String,
     /// The running turn, if any (adopted from acks and resume results).
     active_turn: Option<String>,
     /// Every admitted turn (the host queues concurrent turns itself; each
     /// completes its own prompt reply).
     in_flight: Vec<InFlight>,
+    /// Registry skills for this workspace (slash aliases + palette).
+    skills: Vec<SkillEntry>,
+    /// The permission currently displayed to the client, if any.
+    pending_perm: Option<PendingPerm>,
+    /// Approvals queued behind the displayed one (raw request params;
+    /// drained one at a time — ACP shows one permission per session).
+    perm_queue: Vec<Value>,
+    /// Elicitations awaiting client replies.
+    pending_ui: Vec<PendingUi>,
+    /// User-input ids already presented or auto-cancelled (resume reissues
+    /// and the request/notification pair cannot replay a settled prompt).
+    ui_seen: HashSet<String>,
+    /// Folded session facts (name/goal/branch/todos/usage).
+    facts: SessionFacts,
 }
 
 struct StoreInner {
@@ -86,6 +179,12 @@ struct StoreInner {
 pub struct SessionStore {
     dispatcher: Dispatcher,
     outbound: Outbound,
+    /// Server→client request plane (`session/request_permission`,
+    /// `elicitation/create`).
+    client: Arc<ClientRequests>,
+    /// Whether the client advertised `elicitation.form` at `initialize`
+    /// (gates the userInput bridge; unset ⇒ auto-cancel).
+    elicitation_form: AtomicBool,
     inner: Mutex<StoreInner>,
 }
 
@@ -95,6 +194,8 @@ impl SessionStore {
     pub fn new(dispatcher: Dispatcher, outbound: Outbound) -> Self {
         Self {
             dispatcher,
+            client: ClientRequests::new(outbound.clone()),
+            elicitation_form: AtomicBool::new(false),
             outbound,
             inner: Mutex::new(StoreInner {
                 sessions: HashMap::new(),
@@ -102,10 +203,24 @@ impl SessionStore {
         }
     }
 
+    /// Record the client's `elicitation.form` advertisement (initialize).
+    pub fn set_elicitation_form(&self, supported: bool) {
+        self.elicitation_form.store(supported, Ordering::SeqCst);
+    }
+
+    /// Route a no-method client frame to a pending server→client request.
+    pub fn resolve_client_reply(&self, frame: &Value) -> bool {
+        self.client.resolve(frame)
+    }
+
     /// `session/new`: start one persistent MSP session and register it.
     /// Returns the ACP result object (`sessionId`, `_meta`, `configOptions`,
     /// plus legacy `modes` on v1).
-    pub async fn create_session(&self, ver: u8, params: &Value) -> Result<Value, AcpError> {
+    pub async fn create_session(
+        self: &Arc<Self>,
+        ver: u8,
+        params: &Value,
+    ) -> Result<Value, AcpError> {
         let cwd = params
             .get("cwd")
             .and_then(Value::as_str)
@@ -166,6 +281,16 @@ impl SessionStore {
         // One catalog fetch for the model selector; a failed fetch degrades
         // to an empty selector (the retain-last-good cache covers flaps).
         let models = self.selector_models("session/new").await;
+        // Dynamic slash commands from the workspace's skill registry;
+        // a listing failure degrades to the static command set.
+        let skills = self
+            .fetch_skills(
+                &workspace_root
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+            .await;
 
         let acp_sid = format!("acp-{}", uuid::Uuid::new_v4().simple());
         let mode_vocab = mode_from_msp(&mode).to_string();
@@ -187,9 +312,23 @@ impl SessionStore {
                     reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
                     active_turn,
                     in_flight: Vec::new(),
+                    skills: skills.clone(),
+                    pending_perm: None,
+                    perm_queue: Vec::new(),
+                    pending_ui: Vec::new(),
+                    ui_seen: HashSet::new(),
+                    facts: SessionFacts {
+                        name: session
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        branch: session.get("branch").map(|b| json!({"branch": b.clone()})),
+                        ..SessionFacts::default()
+                    },
                 },
             );
         }
+        self.spawn_observer(&acp_sid);
         tracing::info!(acp_sid, msp_sid, mode, "acp session created");
         let mut result = json!({
             "sessionId": acp_sid,
@@ -203,7 +342,7 @@ impl SessionStore {
         // channel means the writer is gone and the process is exiting).
         let _ = self
             .outbound
-            .send(available_commands_frame(&acp_sid, ver))
+            .send(available_commands_frame(&acp_sid, ver, &skills))
             .await;
         Ok(result)
     }
@@ -220,7 +359,7 @@ impl SessionStore {
             .unwrap_or("")
             .to_string();
         match self.prompt_admit(&acp_sid, &req_id, params).await {
-            Ok(PromptAdmit::Compact) => {}
+            Ok(PromptAdmit::Settled) => {}
             Ok(PromptAdmit::Driver(admitted)) => {
                 let store = Arc::clone(self);
                 tokio::spawn(async move {
@@ -234,11 +373,12 @@ impl SessionStore {
         }
     }
 
-    /// Admit a prompt: validate, run `/compact` inline or `turn/start` and
-    /// register in-flight. Every admitted turn is tracked (the host queues
-    /// concurrent turns itself); each completes its own prompt reply.
+    /// Admit a prompt: validate, run protocol commands inline or
+    /// `turn/start` and register in-flight. Every admitted turn is tracked
+    /// (the host queues concurrent turns itself); each completes its own
+    /// prompt reply.
     async fn prompt_admit(
-        &self,
+        self: &Arc<Self>,
         acp_sid: &str,
         req_id: &Value,
         params: &Value,
@@ -248,7 +388,7 @@ impl SessionStore {
                 "session/prompt requires params.sessionId".to_string(),
             ));
         }
-        let (msp_sid, cwd, ver, effort) = {
+        let (msp_sid, cwd, ver, effort, skills) = {
             let inner = self.inner.lock().await;
             let session = inner
                 .sessions
@@ -259,14 +399,16 @@ impl SessionStore {
                 session.cwd.clone(),
                 session.ver,
                 session.reasoning_effort.clone(),
+                session.skills.clone(),
             )
         };
-        let (input, echo) = extract_prompt(params.get("prompt"), &cwd)?;
-        // `/compact` is a protocol command, not a prompt: run
-        // `session/compact` and settle immediately.
-        if is_compact_command(&echo) {
-            self.run_compact(acp_sid, &msp_sid, ver, req_id).await?;
-            return Ok(PromptAdmit::Compact);
+        let (input, echo) = extract_prompt(params.get("prompt"), &cwd, &skills)?;
+        // Protocol commands run inline and settle immediately — never a
+        // turn (the host sees nothing).
+        if let Some((command, arg)) = protocol_command(&echo) {
+            self.run_protocol_command(acp_sid, &msp_sid, ver, req_id, command, &arg)
+                .await?;
+            return Ok(PromptAdmit::Settled);
         }
         let conn = self.ready_conn().await?;
         // Subscribe BEFORE `turn/start`: view events can precede the ack.
@@ -350,16 +492,84 @@ impl SessionStore {
         }))
     }
 
-    /// Run the `/compact` protocol command: `session/compact` (a `noop`
-    /// status is success, logged with its reason), the user echo, and an
-    /// immediate `end_turn` settlement — never a turn.
-    async fn run_compact(
-        &self,
+    /// Run one protocol command: produce the card (host calls where the
+    /// command maps to MSP), then echo + card + `end_turn` — never a turn.
+    /// `/exit` additionally closes the session after settling. Read cards
+    /// degrade to an error line; mutating commands propagate host errors.
+    async fn run_protocol_command(
+        self: &Arc<Self>,
         acp_sid: &str,
         msp_sid: &str,
         ver: u8,
         req_id: &Value,
+        command: ProtocolCommand,
+        arg: &str,
     ) -> Result<(), AcpError> {
+        let echo_text = format!("/{}{}", command.name(), format_args_for(arg));
+        let card = match command {
+            ProtocolCommand::Compact => self.run_compact(acp_sid, msp_sid).await?,
+            ProtocolCommand::Help => self.help_card(acp_sid).await,
+            ProtocolCommand::Status => self.status_card(acp_sid, msp_sid).await,
+            ProtocolCommand::Usage => self.usage_card(acp_sid).await,
+            ProtocolCommand::Name => self.run_name(acp_sid, msp_sid, arg).await?,
+            ProtocolCommand::Models => self.run_models(acp_sid, msp_sid, arg).await?,
+            ProtocolCommand::Exit => "Session closed.".to_string(),
+            ProtocolCommand::Effort => self.run_effort(acp_sid, msp_sid, arg).await?,
+            ProtocolCommand::Recap => self.recap_card(acp_sid, msp_sid).await,
+        };
+        self.settle_command(acp_sid, ver, req_id, &echo_text, &card)
+            .await;
+        if command == ProtocolCommand::Exit {
+            tracing::info!(acp_sid, "/exit closed the session");
+            let _ = self.close(&json!({"sessionId": acp_sid})).await;
+        }
+        Ok(())
+    }
+
+    /// Echo the command + emit the card + settle `end_turn` (the v1/v2
+    /// framing differs, the sequence does not).
+    async fn settle_command(
+        &self,
+        acp_sid: &str,
+        ver: u8,
+        req_id: &Value,
+        echo_text: &str,
+        card: &str,
+    ) {
+        let echo = Value::Array(vec![json!({"type": "text", "text": echo_text})]);
+        if ver == 2 {
+            self.send(server::result_frame(req_id, json!({}))).await;
+            self.send(user_message_frame(acp_sid, &echo)).await;
+            if !card.is_empty() {
+                let msg_id = format!("msg-{}", uuid::Uuid::new_v4().simple());
+                self.send(message_chunk_frame(acp_sid, ver, &msg_id, card))
+                    .await;
+            }
+            self.send(state_update_frame(acp_sid, "idle", Some("end_turn")))
+                .await;
+        } else {
+            let msg_id = format!("msg-{}", uuid::Uuid::new_v4().simple());
+            if let Value::Array(blocks) = &echo {
+                for block in blocks {
+                    self.send(user_message_chunk_frame(acp_sid, &msg_id, block))
+                        .await;
+                }
+            }
+            if !card.is_empty() {
+                self.send(message_chunk_frame(acp_sid, ver, &msg_id, card))
+                    .await;
+            }
+            self.send(server::result_frame(
+                req_id,
+                json!({"stopReason": "end_turn"}),
+            ))
+            .await;
+        }
+    }
+
+    /// `/compact`: `session/compact` (a `noop` status is success, logged
+    /// with its reason); the card says what happened.
+    async fn run_compact(&self, acp_sid: &str, msp_sid: &str) -> Result<String, AcpError> {
         let conn = self.ready_conn().await?;
         let params = json!({
             "commandId": conn.mint_command_id(),
@@ -369,31 +579,445 @@ impl SessionStore {
             .command_with_retry("session/compact", &params)
             .await
             .map_err(|e| AcpError::msp_command("session/compact", &e))?;
-        if ack.get("status").and_then(Value::as_str) == Some("noop") {
+        let card = if ack.get("status").and_then(Value::as_str) == Some("noop") {
             // Hoisted: `tracing::Value` shadows `serde_json::Value` inside
             // the macro expansion.
             let reason = ack.get("reason").and_then(Value::as_str).unwrap_or("?");
             tracing::info!(acp_sid, reason, "compact noop");
-        }
-        if ver == 2 {
-            self.send(server::result_frame(req_id, json!({}))).await;
-            let echo = Value::Array(vec![json!({"type": "text", "text": "/compact"})]);
-            self.send(user_message_frame(acp_sid, &echo)).await;
-            self.send(state_update_frame(acp_sid, "idle", Some("end_turn")))
-                .await;
+            format!("Nothing to compact ({reason}).")
         } else {
-            let msg_id = format!("msg-{}", uuid::Uuid::new_v4().simple());
-            let block = json!({"type": "text", "text": "/compact"});
-            self.send(user_message_chunk_frame(acp_sid, &msg_id, &block))
-                .await;
-            self.send(server::result_frame(
-                req_id,
-                json!({"stopReason": "end_turn"}),
-            ))
-            .await;
-        }
+            "Compacting the session context.".to_string()
+        };
         tracing::info!(acp_sid, "compact command settled");
-        Ok(())
+        Ok(card)
+    }
+
+    /// `/help`: the advertised command list plus the client gestures.
+    async fn help_card(&self, acp_sid: &str) -> String {
+        let skills = {
+            let inner = self.inner.lock().await;
+            inner
+                .sessions
+                .get(acp_sid)
+                .map(|s| s.skills.clone())
+                .unwrap_or_default()
+        };
+        let mut out = String::from("**Commands**\n\n");
+        for (name, description, hint) in PROTOCOL_COMMANDS {
+            out.push_str(&format!("- `/{name}` — {description}\n"));
+            let _ = hint;
+        }
+        out.push_str("- `/skill <id> [prompt]` — Invoke a Muse skill\n");
+        for skill in &skills {
+            if skill.id.is_empty() {
+                continue;
+            }
+            let desc = if skill.description.is_empty() {
+                "Muse skill"
+            } else {
+                skill.description.as_str()
+            };
+            out.push_str(&format!("- `/{}` — {desc}\n", skill.id));
+        }
+        out.push_str(
+            "\n**Selectors** — Session Mode (ask/auto/deny), Model, and Reasoning Effort \
+             ride the client's configOptions pickers. Prompts sent while a turn runs \
+             queue; v2 clients can also steer the running turn.\n",
+        );
+        out
+    }
+
+    /// `/status`: session/read for metadata plus folded facts and host
+    /// handshake details. Degrades to an error card on failure.
+    async fn status_card(&self, acp_sid: &str, msp_sid: &str) -> String {
+        let conn = match self.ready_conn().await {
+            Ok(conn) => conn,
+            Err(error) => return format!("Status unavailable: {}", error.message),
+        };
+        let read = conn
+            .command_with_retry(
+                "session/read",
+                &json!({
+                    "commandId": conn.mint_command_id(),
+                    "sessionId": msp_sid,
+                }),
+            )
+            .await;
+        let (mode, model, effort, cwd, in_flight, facts) = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => (
+                    s.mode.clone(),
+                    s.model_value.clone(),
+                    s.reasoning_effort.clone(),
+                    s.cwd.clone(),
+                    s.in_flight.len(),
+                    clone_facts(&s.facts),
+                ),
+                None => return "Status unavailable: unknown session.".to_string(),
+            }
+        };
+        let mut out = String::from("**Status**\n\n");
+        match read {
+            Ok(result) => {
+                let session = result.get("session").unwrap_or(&Value::Null);
+                let name = session
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or(facts.name.as_deref())
+                    .unwrap_or("untitled");
+                let turns = session
+                    .get("turnCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let status = session.get("status").and_then(Value::as_str).unwrap_or("?");
+                let updated = session
+                    .get("updatedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                out.push_str(&format!(
+                    "- Session: {name} (`{msp_sid}`) · {status} · {turns} turns · updated {updated}\n"
+                ));
+                if let Some(branch) = session.get("branch").and_then(Value::as_str) {
+                    out.push_str(&format!("- Branch: {branch}\n"));
+                }
+                if let Some(path) = session.get("path").and_then(Value::as_str)
+                    && !path.is_empty()
+                {
+                    out.push_str(&format!("- Log: {path}\n"));
+                }
+                let pending = result
+                    .get("pendingRequests")
+                    .and_then(Value::as_array)
+                    .map(|p| p.len())
+                    .unwrap_or(0);
+                if pending > 0 {
+                    out.push_str(&format!("- Pending host requests: {pending}\n"));
+                }
+            }
+            Err(error) => {
+                out.push_str(&format!(
+                    "- Session `{msp_sid}` (read failed: {})\n",
+                    error.message
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "- Model: {} · Effort: {effort}\n",
+            display_model(&model)
+        ));
+        out.push_str(&format!("- Approval mode: {mode}\n"));
+        if !cwd.is_empty() {
+            out.push_str(&format!("- Workspace: {cwd}\n"));
+        }
+        if let Some(info) = conn.handshake_info() {
+            out.push_str(&format!(
+                "- Host: {} · schema v{} · {}\n",
+                info.host_label(),
+                info.schema_version
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                info.durability.as_deref().unwrap_or("durable?"),
+            ));
+        }
+        if in_flight > 0 {
+            out.push_str(&format!("- In-flight turns: {in_flight}\n"));
+        }
+        if let Some(goal) = &facts.goal
+            && !goal.is_null()
+        {
+            let summary = goal
+                .get("summary")
+                .or_else(|| goal.get("title"))
+                .or_else(|| goal.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !summary.is_empty() {
+                out.push_str(&format!("- Goal: {summary}\n"));
+            }
+        }
+        if let Some(branch) = facts
+            .branch
+            .as_ref()
+            .and_then(|b| b.get("branch"))
+            .and_then(Value::as_str)
+        {
+            out.push_str(&format!("- Branch: {branch}\n"));
+        }
+        append_usage_lines(&mut out, &facts);
+        out
+    }
+
+    /// `/usage`: the folded token/context facts card.
+    async fn usage_card(&self, acp_sid: &str) -> String {
+        let facts = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => clone_facts(&s.facts),
+                None => return "Usage unavailable: unknown session.".to_string(),
+            }
+        };
+        let mut out = String::from("**Usage**\n\n");
+        if facts.cum_total.is_none() && facts.usage_used.is_none() {
+            out.push_str("No usage reported yet — send a prompt first.\n");
+            return out;
+        }
+        append_usage_lines(&mut out, &facts);
+        out
+    }
+
+    /// `/name [name]`: `session/rename` on an argument, or the current name.
+    async fn run_name(&self, acp_sid: &str, msp_sid: &str, arg: &str) -> Result<String, AcpError> {
+        if arg.is_empty() {
+            let known = {
+                let inner = self.inner.lock().await;
+                inner
+                    .sessions
+                    .get(acp_sid)
+                    .and_then(|s| s.facts.name.clone())
+            };
+            return Ok(match known {
+                Some(name) => format!("Session name: {name}"),
+                None => "Session name: untitled — `/name <name>` sets it.".to_string(),
+            });
+        }
+        let conn = self.ready_conn().await?;
+        let ack = conn
+            .command_with_retry(
+                "session/rename",
+                &json!({
+                    "commandId": conn.mint_command_id(),
+                    "sessionId": msp_sid,
+                    "name": arg,
+                }),
+            )
+            .await
+            .map_err(|e| AcpError::msp_command("session/rename", &e))?;
+        // The canonical name arrives in the result or via nameChanged.
+        let settled = ack.get("name").and_then(Value::as_str).unwrap_or(arg);
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(s) = inner.sessions.get_mut(acp_sid) {
+                s.facts.name = Some(settled.to_string());
+            }
+        }
+        Ok(format!("Session renamed to {settled}."))
+    }
+
+    /// `/models` (or `/model <id>`): list the catalog, or switch models.
+    async fn run_models(
+        &self,
+        acp_sid: &str,
+        msp_sid: &str,
+        arg: &str,
+    ) -> Result<String, AcpError> {
+        if !arg.is_empty() {
+            return self.run_model_select(acp_sid, msp_sid, arg).await;
+        }
+        let catalog = self
+            .dispatcher
+            .models()
+            .await
+            .map_err(|e| AcpError::internal(format!("model/list failed: {e}")))?;
+        let current = {
+            let inner = self.inner.lock().await;
+            inner
+                .sessions
+                .get(acp_sid)
+                .map(|s| s.model_value.clone())
+                .unwrap_or_default()
+        };
+        let mut out = String::from("**Models**\n\n");
+        if catalog.models.is_empty() {
+            out.push_str("No models reported by the host.\n");
+        }
+        for model in &catalog.models {
+            let marker = if model.id == current {
+                " (current)"
+            } else {
+                ""
+            };
+            let label = model.display_label.as_deref().unwrap_or(&model.id);
+            let provider = model
+                .owned_by
+                .as_deref()
+                .map(|p| format!(" · {p}"))
+                .unwrap_or_default();
+            out.push_str(&format!("- `{}` — {label}{provider}{marker}\n", model.id));
+        }
+        out.push_str("\nSwitch with `/model <id>` or the client's Model selector.\n");
+        Ok(out)
+    }
+
+    /// `/model <id>`: `session/setModel` (durable for subsequent calls).
+    async fn run_model_select(
+        &self,
+        acp_sid: &str,
+        msp_sid: &str,
+        arg: &str,
+    ) -> Result<String, AcpError> {
+        let conn = self.ready_conn().await?;
+        conn.command_with_retry(
+            "session/setModel",
+            &json!({
+                "commandId": conn.mint_command_id(),
+                "sessionId": msp_sid,
+                "model": {"modelId": arg},
+            }),
+        )
+        .await
+        .map_err(|e| AcpError::msp_command("session/setModel", &e))?;
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(s) = inner.sessions.get_mut(acp_sid) {
+                s.model_value = arg.to_string();
+            }
+        }
+        Ok(format!("Model set to {arg}."))
+    }
+
+    /// `/effort [tier]`: `session/setReasoningEffort` (durable default)
+    /// plus the per-turn override the selector owns, or the current tier.
+    async fn run_effort(
+        &self,
+        acp_sid: &str,
+        msp_sid: &str,
+        arg: &str,
+    ) -> Result<String, AcpError> {
+        if arg.is_empty() {
+            let effort = {
+                let inner = self.inner.lock().await;
+                inner
+                    .sessions
+                    .get(acp_sid)
+                    .map(|s| s.reasoning_effort.clone())
+                    .unwrap_or_else(|| DEFAULT_REASONING_EFFORT.to_string())
+            };
+            return Ok(format!(
+                "Reasoning effort: {effort} — `/effort <{}>` sets it.",
+                EFFORT_TIERS.join("|")
+            ));
+        }
+        if !is_reasoning_effort(arg) {
+            return Ok(format!(
+                "Unknown effort '{arg}' — pick one of: {}.",
+                EFFORT_TIERS.join(", ")
+            ));
+        }
+        let conn = self.ready_conn().await?;
+        conn.command_with_retry(
+            "session/setReasoningEffort",
+            &json!({
+                "commandId": conn.mint_command_id(),
+                "sessionId": msp_sid,
+                "reasoningEffort": arg,
+            }),
+        )
+        .await
+        .map_err(|e| AcpError::msp_command("session/setReasoningEffort", &e))?;
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(s) = inner.sessions.get_mut(acp_sid) {
+                s.reasoning_effort = arg.to_string();
+            }
+        }
+        Ok(format!("Reasoning effort set to {arg}."))
+    }
+
+    /// `/recap`: the folded session history distilled to a card — the last
+    /// user prompt, the last agent answer, and the queue depth.
+    async fn recap_card(&self, acp_sid: &str, msp_sid: &str) -> String {
+        let conn = match self.ready_conn().await {
+            Ok(conn) => conn,
+            Err(error) => return format!("Recap unavailable: {}", error.message),
+        };
+        let result = match conn
+            .command_with_retry(
+                "session/read",
+                &json!({
+                    "commandId": conn.mint_command_id(),
+                    "sessionId": msp_sid,
+                    "excludeItems": false,
+                }),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return format!("Recap unavailable: {}", error.message),
+        };
+        let (facts, in_flight) = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => (clone_facts(&s.facts), s.in_flight.len()),
+                None => (SessionFacts::default(), 0),
+            }
+        };
+        let session = result.get("session").unwrap_or(&Value::Null);
+        let mut out = String::from("**Recap**\n\n");
+        let name = session
+            .get("name")
+            .and_then(Value::as_str)
+            .or(facts.name.as_deref())
+            .unwrap_or("untitled");
+        let turns = session
+            .get("turnCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        out.push_str(&format!("- {name} · {turns} completed turns"));
+        if in_flight > 0 {
+            out.push_str(&format!(" · {in_flight} in flight"));
+        }
+        out.push('\n');
+        if let Some(goal) = &facts.goal
+            && !goal.is_null()
+        {
+            let summary = goal
+                .get("summary")
+                .or_else(|| goal.get("title"))
+                .or_else(|| goal.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !summary.is_empty() {
+                out.push_str(&format!("- Goal: {summary}\n"));
+            }
+        }
+        let items = result
+            .get("history")
+            .and_then(|h| h.get("items"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let last_of = |kind: &str| -> Option<String> {
+            items
+                .iter()
+                .rev()
+                .find(|i| i.get("kind").and_then(Value::as_str) == Some(kind))
+                .and_then(|i| {
+                    i.get("text")
+                        .or_else(|| i.get("fallbackText"))
+                        .and_then(Value::as_str)
+                })
+                .map(|t| truncate(&t.replace('\n', " "), 200))
+        };
+        if let Some(prompt) = last_of("userMessage") {
+            out.push_str(&format!("- Last prompt: {prompt}\n"));
+        }
+        if let Some(answer) = last_of("agentMessage") {
+            out.push_str(&format!("- Last answer: {answer}\n"));
+        }
+        if let Some(todos) = &facts.todos {
+            let open = todos
+                .iter()
+                .filter(|t| t.get("status").and_then(Value::as_str) != Some("completed"))
+                .count();
+            if !todos.is_empty() {
+                out.push_str(&format!("- Tasks: {open} open / {} total\n", todos.len()));
+            }
+        }
+        if items.is_empty() {
+            out.push_str("- No history on record yet.\n");
+        }
+        out
     }
 
     /// `session/cancel` (a notification): `session/cancel` stops all
@@ -453,6 +1077,14 @@ impl SessionStore {
         let Some(session) = removed else {
             return Err(AcpError::invalid_params("unknown sessionId".to_string()));
         };
+        // Retire dialog waiters: dropping each oneshot resolves its
+        // completer task with `Err`, which fails closed and exits.
+        if let Some(perm) = &session.pending_perm {
+            self.client.cancel(&perm.req_id);
+        }
+        for ui in &session.pending_ui {
+            self.client.cancel(&ui.req_id);
+        }
         if !session.in_flight.is_empty() {
             let conn = self.ready_conn().await.ok();
             for in_flight in &session.in_flight {
@@ -573,7 +1205,7 @@ impl SessionStore {
     /// history; v2 `session/resume` replays only with `replayFrom`; v1
     /// `session/resume` reconnects silently.
     pub async fn resume_or_load(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         ver: u8,
         params: &Value,
@@ -660,6 +1292,16 @@ impl SessionStore {
         };
         let replay = method == "session/load"
             || (method == "session/resume" && ver == 2 && params.get("replayFrom").is_some());
+        // Re-resuming a known session keeps its registry; a fresh entry
+        // needs the workspace's skills + a spawned observer.
+        let (is_new, skills) = {
+            let known = self.inner.lock().await.sessions.contains_key(&sid);
+            if known {
+                (false, Vec::new())
+            } else {
+                (true, self.fetch_skills(&restored_cwd).await)
+            }
+        };
         let (mode_vocab, model_value, effort) = {
             let mut inner = self.inner.lock().await;
             let entry = inner
@@ -674,6 +1316,12 @@ impl SessionStore {
                     reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
                     active_turn: None,
                     in_flight: Vec::new(),
+                    skills: skills.clone(),
+                    pending_perm: None,
+                    perm_queue: Vec::new(),
+                    pending_ui: Vec::new(),
+                    ui_seen: HashSet::new(),
+                    facts: SessionFacts::default(),
                 });
             entry.msp_sid = real_msp.clone();
             entry.ver = ver;
@@ -696,12 +1344,23 @@ impl SessionStore {
             {
                 entry.mode = mode_from_msp(folded).to_string();
             }
+            // Seed facts from the folded session object so /status and
+            // /usage read real values before the first live event lands.
+            if let Some(name) = session.get("name").and_then(Value::as_str) {
+                entry.facts.name = Some(name.to_string());
+            }
+            if let Some(branch) = session.get("branch") {
+                entry.facts.branch = Some(json!({"branch": branch.clone()}));
+            }
             (
                 entry.mode.clone(),
                 entry.model_value.clone(),
                 entry.reasoning_effort.clone(),
             )
         };
+        if is_new {
+            self.spawn_observer(&sid);
+        }
         if replay {
             for frame in replay_history(&sid, ver, &resumed) {
                 self.send(frame).await;
@@ -717,17 +1376,30 @@ impl SessionStore {
         if ver != 2 {
             result["modes"] = session_modes(&mode_vocab);
         }
+        let skills = {
+            let inner = self.inner.lock().await;
+            inner
+                .sessions
+                .get(&sid)
+                .map(|s| s.skills.clone())
+                .unwrap_or_default()
+        };
         let _ = self
             .outbound
-            .send(available_commands_frame(&sid, ver))
+            .send(available_commands_frame(&sid, ver, &skills))
             .await;
+        // A resumed session may hold approvals/prompts issued before the
+        // attach: pull `approval/listPending` and present each unknown one
+        // (the observer's live stream may have delivered them already —
+        // dedupe by id resolves pull-vs-reissue races to one dialog).
+        self.reconcile_pending(&sid).await;
         Ok(result)
     }
 
     /// `session/fork`: branch a session's history into a new session. An
     /// absent cut point forks all completed turns; a JetBrains AIR fork
     /// point resolves to `cutPoint.lastTurnId` via `session/read`.
-    pub async fn fork(&self, ver: u8, params: &Value) -> Result<Value, AcpError> {
+    pub async fn fork(self: &Arc<Self>, ver: u8, params: &Value) -> Result<Value, AcpError> {
         let src_sid = params
             .get("sessionId")
             .and_then(Value::as_str)
@@ -806,6 +1478,7 @@ impl SessionStore {
         {
             mode_vocab = mode_from_msp(folded).to_string();
         }
+        let skills = self.fetch_skills(&restored_cwd).await;
         let acp_sid = format!("acp-{}", uuid::Uuid::new_v4().simple());
         {
             let mut inner = self.inner.lock().await;
@@ -823,9 +1496,25 @@ impl SessionStore {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     in_flight: Vec::new(),
+                    skills: skills.clone(),
+                    pending_perm: None,
+                    perm_queue: Vec::new(),
+                    pending_ui: Vec::new(),
+                    ui_seen: HashSet::new(),
+                    facts: SessionFacts {
+                        name: new_session
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        branch: new_session
+                            .get("branch")
+                            .map(|b| json!({"branch": b.clone()})),
+                        ..SessionFacts::default()
+                    },
                 },
             );
         }
+        self.spawn_observer(&acp_sid);
         tracing::info!(acp_sid, msp_sid = new_msp, "acp session forked");
         let models = self.selector_models("session/fork").await;
         let mut result = json!({
@@ -838,7 +1527,7 @@ impl SessionStore {
         }
         let _ = self
             .outbound
-            .send(available_commands_frame(&acp_sid, ver))
+            .send(available_commands_frame(&acp_sid, ver, &skills))
             .await;
         Ok(result)
     }
@@ -1071,7 +1760,7 @@ impl SessionStore {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let (msp_sid, cwd, effort, active_turn) = {
+        let (msp_sid, cwd, effort, active_turn, skills) = {
             let inner = self.inner.lock().await;
             match inner.sessions.get(&sid) {
                 Some(s) => (
@@ -1079,6 +1768,7 @@ impl SessionStore {
                     s.cwd.clone(),
                     s.reasoning_effort.clone(),
                     s.active_turn.clone(),
+                    s.skills.clone(),
                 ),
                 None => {
                     self.send(server::error_frame(&req_id, -32602, "unknown sessionId"))
@@ -1087,7 +1777,7 @@ impl SessionStore {
                 }
             }
         };
-        let (input, echo) = match extract_prompt(params.get("prompt"), &cwd) {
+        let (input, echo) = match extract_prompt(params.get("prompt"), &cwd, &skills) {
             Ok((input, echo)) if !input.parts.is_empty() => (input, echo),
             Ok(_) => {
                 self.send(server::error_frame(
@@ -1235,6 +1925,951 @@ impl SessionStore {
         Ok(())
     }
 
+    /// The workspace's skill registry (`muse skills list --json` beside the
+    /// supervised host — same binary and posture). Failure ⇒ empty (static
+    /// fallback set).
+    async fn fetch_skills(&self, cwd: &str) -> Vec<SkillEntry> {
+        skills::list_skills(self.dispatcher.supervisor().config(), cwd).await
+    }
+
+    /// Spawn the per-session observer: folds session notifications into
+    /// [`SessionFacts`], bridges `plan`/`session_info_update`/`usage_update`,
+    /// and owns the approval/user-input dialogs. Exits when the session is
+    /// removed or the supervisor is exhausted; resubscribes across host
+    /// restarts.
+    fn spawn_observer(self: &Arc<Self>, acp_sid: &str) {
+        let store = Arc::clone(self);
+        let acp_sid = acp_sid.to_string();
+        tokio::spawn(async move { observe_session(store, acp_sid).await });
+    }
+
+    /// One host event for one session: fold facts under the lock, then send
+    /// derived frames and run dialog work off-lock. `false` retires the
+    /// observer (the session is gone).
+    async fn observe_event(self: &Arc<Self>, acp_sid: &str, method: &str, params: &Value) -> bool {
+        let msp_sid = session_of(method, params);
+        enum Pending {
+            Approval(Value),
+            UserInput(Value),
+        }
+        let mut frames: Vec<Value> = Vec::new();
+        let mut pending: Option<Pending> = None;
+        {
+            let mut inner = self.inner.lock().await;
+            let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                return false;
+            };
+            if msp_sid.is_empty() || session.msp_sid != msp_sid {
+                return true; // another session's event; keep watching
+            }
+            match method {
+                "session/nameChanged" => {
+                    session.facts.name = params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                "session/goalChanged" => {
+                    // Key present ⇒ replace (explicit `null` clears).
+                    if let Some(goal) = params.get("goal") {
+                        session.facts.goal = Some(goal.clone());
+                    }
+                }
+                "session/branchChanged" => {
+                    session.facts.branch = Some(json!({
+                        "branch": params.get("branch").cloned().unwrap_or(Value::Null),
+                        "vcs": params.get("vcs").cloned().unwrap_or(Value::Null),
+                        "workspaceRoot": params.get("workspaceRoot").cloned().unwrap_or(Value::Null),
+                    }));
+                }
+                "session/todoListChanged" => {
+                    if let Some(items) = params.get("items").and_then(Value::as_array) {
+                        session.facts.todos = Some(items.clone());
+                    }
+                }
+                "session/contextUsage" => {
+                    // Replace wholesale: an absent `windowTokens` means the
+                    // basis has no limit — drop the stale size rather than
+                    // re-emit it.
+                    session.facts.usage_used = params.get("usedTokens").and_then(Value::as_u64);
+                    session.facts.usage_size = params.get("windowTokens").and_then(Value::as_u64);
+                    session.facts.usage_pressure = params
+                        .get("pressure")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                "session/tokenUsage" => {
+                    if let Some(c) = params.get("cumulative") {
+                        session.facts.cum_prompt = c.get("promptTokens").and_then(Value::as_u64);
+                        session.facts.cum_output = c.get("outputTokens").and_then(Value::as_u64);
+                        session.facts.cum_total = c.get("totalTokens").and_then(Value::as_u64);
+                    }
+                }
+                "session/modelChanged" => {
+                    if let Some(model) = params.get("modelId").and_then(Value::as_str)
+                        && !model.is_empty()
+                    {
+                        session.model_value = model.to_string();
+                    }
+                }
+                "session/approvalModeChanged" => {
+                    if let Some(mode) = params.get("mode").and_then(Value::as_str)
+                        && !mode.is_empty()
+                    {
+                        session.mode = mode_from_msp(mode).to_string();
+                    }
+                }
+                "session/reasoningEffortChanged" => {
+                    if let Some(tier) = params.get("reasoningEffort").and_then(Value::as_str)
+                        && is_reasoning_effort(tier)
+                    {
+                        session.reasoning_effort = tier.to_string();
+                    }
+                }
+                "turn/started" => {
+                    if let Some(turn_id) = params.get("turnId").and_then(Value::as_str)
+                        && !turn_id.is_empty()
+                    {
+                        session.active_turn = Some(turn_id.to_string());
+                    }
+                }
+                _ => {}
+            }
+            match method {
+                "session/todoListChanged" => {
+                    if let Some(frame) = plan_frame(acp_sid, session.facts.todos.as_deref()) {
+                        frames.push(frame);
+                    }
+                }
+                "session/goalChanged" | "session/branchChanged" => {
+                    if let Some(frame) = session_meta_frame(acp_sid, &session.facts) {
+                        frames.push(frame);
+                    }
+                }
+                "session/contextUsage" => {
+                    // The fresh pressure rides this frame (upstream parity).
+                    let pressure = session.facts.usage_pressure.clone();
+                    if let Some(frame) = usage_frame(acp_sid, &session.facts, pressure.as_deref()) {
+                        frames.push(frame);
+                    }
+                }
+                "session/tokenUsage" => {
+                    if let Some(frame) = usage_frame(acp_sid, &session.facts, None) {
+                        frames.push(frame);
+                    }
+                }
+                // Authoritative outcome: if session work continues,
+                // re-assert running (a resolved approval unblocks the turn).
+                "approval/resolved" | "approval/updated" => {
+                    if session.ver == 2 && !session.in_flight.is_empty() {
+                        frames.push(state_update_frame(acp_sid, "running", None));
+                    }
+                }
+                // Both legs of one pending request: the request and its
+                // `*ed` notification dedupe by id inside the handlers.
+                "approval/request" | "approval/requested" => {
+                    pending = Some(Pending::Approval(params.clone()));
+                }
+                "userInput/request" | "userInput/requested" => {
+                    pending = Some(Pending::UserInput(params.clone()));
+                }
+                _ => {}
+            }
+        }
+        for frame in frames {
+            self.send(frame).await;
+        }
+        match pending {
+            Some(Pending::Approval(p)) => self.open_approval(acp_sid, &p).await,
+            Some(Pending::UserInput(p)) => self.route_user_input(acp_sid, &p).await,
+            None => {}
+        }
+        true
+    }
+
+    /// The turn an approval blocks: `params.turnId` when the host names it,
+    /// else the session's in-flight turn (the fake and some hosts omit the
+    /// field — the approval still belongs to the running turn).
+    async fn approval_turn_id(&self, acp_sid: &str, params: &Value) -> String {
+        if let Some(id) = params.get("turnId").and_then(Value::as_str)
+            && !id.is_empty()
+        {
+            return id.to_string();
+        }
+        let inner = self.inner.lock().await;
+        inner
+            .sessions
+            .get(acp_sid)
+            .and_then(|s| s.in_flight.last().map(|f| f.turn_id.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Present an MSP approval to the client as `session/request_permission`
+    /// (ported from `muse-acp` `open_approval`). One dialog per session at a
+    /// time: a second approval queues behind the displayed one and ids
+    /// dedupe across the request/notification pair.
+    // Boxed so the future is an opaque `Send`: `complete_permission` re-enters
+    // this through `pop_queued_approval`, and an unboxed coroutine cycle would
+    // make the whole chain unresolvable for the `tokio::spawn` bound.
+    fn open_approval<'a>(
+        self: &'a Arc<Self>,
+        acp_sid: &'a str,
+        params: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let approval_id = params
+                .get("approvalId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let tool_name = params
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("Muse action")
+                .to_string();
+            if approval_id.is_empty() {
+                // Fail closed like the HTTP surface: decide blind is never an
+                // option, so the turn cannot run on an undecidable approval.
+                let turn_id = self.approval_turn_id(acp_sid, params).await;
+                tracing::warn!(
+                    acp_sid,
+                    tool = tool_name,
+                    "approval request without an approvalId; cancelling the turn"
+                );
+                if !turn_id.is_empty()
+                    && let Ok(conn) = self.ready_conn().await
+                {
+                    let msp_sid = {
+                        let from_params = session_of("approval/request", params);
+                        if !from_params.is_empty() {
+                            from_params
+                        } else {
+                            let inner = self.inner.lock().await;
+                            inner
+                                .sessions
+                                .get(acp_sid)
+                                .map(|s| s.msp_sid.clone())
+                                .unwrap_or_default()
+                        }
+                    };
+                    cancel_turn(&conn, &msp_sid, &turn_id).await;
+                }
+                return;
+            }
+            {
+                let mut inner = self.inner.lock().await;
+                let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                    return;
+                };
+                if session
+                    .pending_perm
+                    .as_ref()
+                    .is_some_and(|p| p.approval_id == approval_id)
+                {
+                    return; // the other leg of this same request
+                }
+                if session.pending_perm.is_some() {
+                    if session
+                        .perm_queue
+                        .iter()
+                        .any(|p| p.get("approvalId").and_then(Value::as_str) == Some(approval_id))
+                    {
+                        return;
+                    }
+                    session.perm_queue.push(params.clone());
+                    tracing::info!(
+                        acp_sid,
+                        approval_id,
+                        "approval queued behind the displayed permission"
+                    );
+                    return;
+                }
+            }
+            let (options, choices) = perm_options(params);
+            if choices.is_empty() {
+                tracing::warn!(
+                    acp_sid,
+                    approval_id,
+                    "approval has no decidable choices; left for the host"
+                );
+                return;
+            }
+            let requirement = params
+                .get("currentRequirementId")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let turn_id = self.approval_turn_id(acp_sid, params).await;
+            let subject = params.get("subject").cloned().unwrap_or(Value::Null);
+            let tool_call_id = params
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let (title, kind) = approval_presentation(&subject, &tool_name);
+            let raw_input = if subject.is_object() {
+                subject.clone()
+            } else {
+                Value::Null
+            };
+            let ver = {
+                let mut inner = self.inner.lock().await;
+                let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                    return;
+                };
+                session.pending_perm = Some(PendingPerm {
+                    req_id: Value::Null,
+                    approval_id: approval_id.to_string(),
+                    requirement,
+                    turn_id,
+                    choices,
+                });
+                session.ver
+            };
+            if ver == 2 {
+                self.send(state_update_frame(acp_sid, "requires_action", None))
+                    .await;
+            }
+            let mut tool_call = json!({
+                "toolCallId": tool_call_id,
+                "title": title,
+                "kind": kind,
+                "status": "pending",
+            });
+            if !raw_input.is_null() {
+                tool_call["rawInput"] = raw_input;
+            }
+            let req_params = if ver == 2 {
+                json!({
+                    "sessionId": acp_sid,
+                    "title": title,
+                    "subject": {"type": "tool_call", "toolCall": tool_call},
+                    "options": options,
+                })
+            } else {
+                json!({
+                    "sessionId": acp_sid,
+                    "toolCall": tool_call,
+                    "options": options,
+                })
+            };
+            let (req_id, rx) = self
+                .client
+                .request("perm", req_params, "session/request_permission")
+                .await;
+            {
+                let mut inner = self.inner.lock().await;
+                match inner
+                    .sessions
+                    .get_mut(acp_sid)
+                    .and_then(|s| s.pending_perm.as_mut())
+                {
+                    Some(p) if p.approval_id == approval_id => p.req_id = req_id.clone(),
+                    // Closed/replaced mid-send: drop the waiter so its completer
+                    // exits instead of parking on a session that is gone.
+                    _ => {
+                        self.client.cancel(&req_id);
+                        return;
+                    }
+                }
+            }
+            let store = Arc::clone(self);
+            let sid = acp_sid.to_string();
+            tokio::spawn(async move {
+                store
+                    .complete_permission(&sid, &req_id, rx.await.ok())
+                    .await;
+            });
+        })
+    }
+
+    /// The client reply to `session/request_permission` (correlated by the
+    /// waiter, not an id scan). Fail closed (ported from `muse-acp`
+    /// `complete_permission`): only an explicit approving selection may
+    /// approve; errors/dismissals decide the first non-approving choice,
+    /// and a list without one cancels the turn rather than approve.
+    async fn complete_permission(
+        self: &Arc<Self>,
+        acp_sid: &str,
+        req_id: &Value,
+        reply: Option<Value>,
+    ) {
+        let (msp_sid, ver, pending) = {
+            let mut inner = self.inner.lock().await;
+            let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                return;
+            };
+            let Some(p) = session.pending_perm.take() else {
+                return; // late/duplicate reply after a settle
+            };
+            (session.msp_sid.clone(), session.ver, p)
+        };
+        let _ = req_id;
+        enum Verdict {
+            Approve(String),
+            Deny(String),
+            FailClosed,
+        }
+        let is_approving = |cid: &str| {
+            pending
+                .choices
+                .iter()
+                .find(|(id, _)| id == cid)
+                .map(|(_, d)| is_approving_decision(d))
+                .unwrap_or(false)
+        };
+        let fallback = || fallback_deny(&pending.choices);
+        let verdict = match reply {
+            None => {
+                tracing::warn!(acp_sid, "client reply lost; failing closed");
+                fallback().map_or(Verdict::FailClosed, Verdict::Deny)
+            }
+            Some(frame) if frame.get("error").is_some() => {
+                tracing::warn!(
+                    acp_sid,
+                    "session/request_permission errored at the client; failing closed"
+                );
+                fallback().map_or(Verdict::FailClosed, Verdict::Deny)
+            }
+            Some(frame) => {
+                let outcome = frame.get("result").and_then(|r| r.get("outcome"));
+                match outcome
+                    .and_then(|o| o.get("outcome"))
+                    .and_then(Value::as_str)
+                {
+                    Some("selected") => match outcome
+                        .and_then(|o| o.get("optionId"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(cid) if is_approving(cid) => Verdict::Approve(cid.to_string()),
+                        Some(cid) => Verdict::Deny(cid.to_string()),
+                        None => fallback().map_or(Verdict::FailClosed, Verdict::Deny),
+                    },
+                    _ => fallback().map_or(Verdict::FailClosed, Verdict::Deny),
+                }
+            }
+        };
+        let choice = match verdict {
+            Verdict::Approve(c) | Verdict::Deny(c) => c,
+            Verdict::FailClosed => {
+                tracing::warn!(
+                    acp_sid,
+                    approval_id = pending.approval_id,
+                    "no deny choice available; cancelling the turn rather than approve"
+                );
+                if let Ok(conn) = self.ready_conn().await {
+                    cancel_turn(&conn, &msp_sid, &pending.turn_id).await;
+                }
+                self.pop_queued_approval(acp_sid).await;
+                return;
+            }
+        };
+        let conn = match self.ready_conn().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(acp_sid, message = %error.message, "approval/decide unreachable");
+                self.pop_queued_approval(acp_sid).await;
+                return;
+            }
+        };
+        let decide_params = json!({
+            "commandId": conn.mint_command_id(),
+            "sessionId": msp_sid,
+            "approvalId": pending.approval_id,
+            "requirementId": pending.requirement,
+            "choiceId": choice,
+        });
+        match conn
+            .command_with_retry("approval/decide", &decide_params)
+            .await
+        {
+            Ok(result) => {
+                // Admission is not the outcome: `terminal: false` means
+                // further requirements remain pending, so the dialog's
+                // successor keeps the requires_action posture.
+                let terminal = result
+                    .get("terminal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if ver == 2 && terminal {
+                    let busy = {
+                        let inner = self.inner.lock().await;
+                        inner
+                            .sessions
+                            .get(acp_sid)
+                            .map(|s| !s.in_flight.is_empty())
+                            .unwrap_or(false)
+                    };
+                    if busy {
+                        self.send(state_update_frame(acp_sid, "running", None))
+                            .await;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    acp_sid,
+                    approval_id = pending.approval_id,
+                    kind = error.kind(),
+                    message = %error.message,
+                    "approval/decide failed"
+                );
+            }
+        }
+        // Decided or not, the displayed permission is settled from the
+        // client's perspective; show the next queued approval.
+        self.pop_queued_approval(acp_sid).await;
+    }
+
+    /// Display the next queued approval for a session, if any.
+    async fn pop_queued_approval(self: &Arc<Self>, acp_sid: &str) {
+        let next = {
+            let mut inner = self.inner.lock().await;
+            inner.sessions.get_mut(acp_sid).and_then(|s| {
+                if s.pending_perm.is_some() || s.perm_queue.is_empty() {
+                    None
+                } else {
+                    Some(s.perm_queue.remove(0))
+                }
+            })
+        };
+        if let Some(params) = next {
+            self.open_approval(acp_sid, &params).await;
+        }
+    }
+
+    /// Route an MSP `userInput` prompt (request or notification leg) to the
+    /// elicitation bridge, or auto-cancel it when the client advertised no
+    /// `elicitation.form`. `ui_seen` + `pending_ui` dedupe the pair and any
+    /// reissue.
+    async fn route_user_input(self: &Arc<Self>, acp_sid: &str, params: &Value) {
+        let user_input_id = params
+            .get("userInputId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if user_input_id.is_empty() {
+            return;
+        }
+        {
+            let mut inner = self.inner.lock().await;
+            let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                return;
+            };
+            if session
+                .pending_ui
+                .iter()
+                .any(|p| p.user_input_id == user_input_id)
+                || session.ui_seen.contains(&user_input_id)
+            {
+                return; // already presented or settled by us
+            }
+            session.ui_seen.insert(user_input_id.clone());
+        }
+        if self.elicitation_form.load(Ordering::SeqCst)
+            && self.bridge_user_input(acp_sid, params).await
+        {
+            return;
+        }
+        tracing::info!(
+            acp_sid,
+            user_input_id,
+            "userInput not bridged (no elicitation.form); auto-cancelling"
+        );
+        self.cancel_user_input(acp_sid, params, USER_INPUT_CANCEL_REASON)
+            .await;
+    }
+
+    /// Bridge an MSP `userInput` prompt to `elicitation/create` (form mode).
+    /// Ported from `muse-acp` `bridge_user_input`: one schema property per
+    /// question (`q{i}`), deduped display labels mapping back to originals
+    /// by position. `false` = nothing bridgeable (caller falls back).
+    async fn bridge_user_input(self: &Arc<Self>, acp_sid: &str, params: &Value) -> bool {
+        let user_input_id = params
+            .get("userInputId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let tool_call = params
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let questions = match params.get("questions").and_then(Value::as_array) {
+            Some(q) if !q.is_empty() => q.clone(),
+            _ => return false,
+        };
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        let mut msg = Vec::new();
+        let mut ui_qs = Vec::new();
+        for (i, q) in questions.iter().enumerate() {
+            let qid = q.get("id").and_then(Value::as_str).unwrap_or("");
+            if qid.is_empty() {
+                continue;
+            }
+            let header = q.get("header").and_then(Value::as_str).unwrap_or("");
+            let text = q.get("question").and_then(Value::as_str).unwrap_or("");
+            // Dedupe display labels (duplicate enum values confuse clients);
+            // answers map back to originals by position.
+            let mut labels = Vec::new();
+            let mut display = Vec::new();
+            if let Some(options) = q.get("options").and_then(Value::as_array) {
+                for option in options {
+                    if let Some(label) = option.get("label").and_then(Value::as_str) {
+                        let mut name = label.to_string();
+                        let mut n = 2;
+                        while display.iter().any(|e: &String| e == &name) {
+                            name = format!("{label} ({n})");
+                            n += 1;
+                        }
+                        labels.push(label.to_string());
+                        display.push(name);
+                    }
+                }
+            }
+            let single = q
+                .get("selection")
+                .and_then(|s| s.get("mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("single")
+                == "single";
+            let min = q
+                .get("selection")
+                .and_then(|s| s.get("minSelections"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let max = q
+                .get("selection")
+                .and_then(|s| s.get("maxSelections"))
+                .and_then(Value::as_u64);
+            let key = format!("q{i}");
+            if labels.is_empty() {
+                // Free-text question: no options, plain string answer.
+                props.insert(key.clone(), json!({"type": "string"}));
+            } else if single {
+                props.insert(key.clone(), json!({"type": "string", "enum": display}));
+            } else {
+                let mut schema = json!({
+                    "type": "array",
+                    "items": {"type": "string", "enum": display},
+                    "minItems": min,
+                });
+                if let Some(m) = max {
+                    schema["maxItems"] = json!(m);
+                }
+                props.insert(key.clone(), schema);
+            }
+            if single || min > 0 {
+                required.push(key);
+            }
+            msg.push(format!("{header}: {text}"));
+            ui_qs.push(UiQuestion {
+                qid: qid.to_string(),
+                labels,
+                display,
+            });
+        }
+        if ui_qs.is_empty() {
+            return false;
+        }
+        let mut elic_params = json!({
+            "sessionId": acp_sid,
+            "mode": "form",
+            "message": msg.join("\n"),
+            "requestedSchema": {
+                "type": "object",
+                "properties": Value::Object(props),
+                "required": required,
+            },
+        });
+        if !tool_call.is_empty() {
+            elic_params["toolCallId"] = Value::String(tool_call);
+        }
+        let ver = {
+            let mut inner = self.inner.lock().await;
+            let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                return false;
+            };
+            session.pending_ui.push(PendingUi {
+                req_id: Value::Null,
+                user_input_id: user_input_id.clone(),
+                questions: ui_qs,
+            });
+            session.ver
+        };
+        if ver == 2 {
+            self.send(state_update_frame(acp_sid, "requires_action", None))
+                .await;
+        }
+        let (req_id, rx) = self
+            .client
+            .request("elic", elic_params, "elicitation/create")
+            .await;
+        {
+            let mut inner = self.inner.lock().await;
+            match inner.sessions.get_mut(acp_sid).and_then(|s| {
+                s.pending_ui
+                    .iter_mut()
+                    .find(|p| p.user_input_id == user_input_id)
+            }) {
+                Some(p) => p.req_id = req_id.clone(),
+                None => {
+                    self.client.cancel(&req_id);
+                    return true; // session went; still counts as handled
+                }
+            }
+        }
+        tracing::info!(acp_sid, user_input_id, "bridged userInput to elicitation");
+        let store = Arc::clone(self);
+        let sid = acp_sid.to_string();
+        tokio::spawn(async move {
+            store
+                .complete_elicitation(&sid, &req_id, rx.await.ok())
+                .await;
+        });
+        true
+    }
+
+    /// The client reply to `elicitation/create`: `accept` + content maps
+    /// back to `userInput/answer`; anything else cancels the prompt.
+    /// (Ported from `muse-acp` `complete_elicitation`.)
+    async fn complete_elicitation(
+        self: &Arc<Self>,
+        acp_sid: &str,
+        req_id: &Value,
+        reply: Option<Value>,
+    ) {
+        let (msp_sid, ver, pending) = {
+            let mut inner = self.inner.lock().await;
+            let Some(session) = inner.sessions.get_mut(acp_sid) else {
+                return;
+            };
+            let Some(idx) = session.pending_ui.iter().position(|p| &p.req_id == req_id) else {
+                return; // not ours (late duplicate); ignore
+            };
+            let p = session.pending_ui.remove(idx);
+            (session.msp_sid.clone(), session.ver, p)
+        };
+        // accept + content -> answers; anything else -> cancel.
+        let mut answers: Option<Vec<Value>> = None;
+        if let Some(frame) = &reply
+            && frame.get("error").is_none()
+            && frame
+                .get("result")
+                .and_then(|r| r.get("action"))
+                .and_then(Value::as_str)
+                == Some("accept")
+        {
+            let content = frame
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let mut parts = Vec::new();
+            for (i, q) in pending.questions.iter().enumerate() {
+                let key = format!("q{i}");
+                match content.get(key.as_str()) {
+                    Some(Value::String(v)) => match ui_original(q, v.as_str()) {
+                        Some(orig) => {
+                            parts.push(json!({"questionId": q.qid, "selectedLabel": orig}))
+                        }
+                        None => parts.push(json!({"questionId": q.qid, "freeText": v})),
+                    },
+                    Some(Value::Array(vs)) => {
+                        let mut matched = Vec::new();
+                        let mut free = Vec::new();
+                        for v in vs {
+                            match v.as_str().and_then(|s| ui_original(q, s)) {
+                                Some(orig) => matched.push(Value::String(orig)),
+                                None => {
+                                    if let Some(s) = v.as_str() {
+                                        free.push(s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        let mut answer = json!({"questionId": q.qid});
+                        if !matched.is_empty() {
+                            answer["selectedLabels"] = Value::Array(matched);
+                        }
+                        if !free.is_empty() {
+                            answer["freeText"] = Value::String(free.join(", "));
+                        }
+                        parts.push(answer);
+                    }
+                    _ => {}
+                }
+            }
+            answers = Some(parts);
+        }
+        let conn = match self.ready_conn().await {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!(acp_sid, message = %error.message, "userInput settle unreachable");
+                return;
+            }
+        };
+        match answers {
+            Some(answers) => {
+                let params = json!({
+                    "commandId": conn.mint_command_id(),
+                    "sessionId": msp_sid,
+                    "userInputId": pending.user_input_id,
+                    "answers": answers,
+                });
+                match conn.command_with_retry("userInput/answer", &params).await {
+                    Ok(_) => {
+                        if ver == 2 {
+                            let busy = {
+                                let inner = self.inner.lock().await;
+                                inner
+                                    .sessions
+                                    .get(acp_sid)
+                                    .map(|s| !s.in_flight.is_empty())
+                                    .unwrap_or(false)
+                            };
+                            if busy {
+                                self.send(state_update_frame(acp_sid, "running", None))
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        acp_sid,
+                        kind = error.kind(),
+                        message = %error.message,
+                        "userInput/answer failed"
+                    ),
+                }
+            }
+            None => {
+                let reason = match &reply {
+                    Some(frame) if frame.get("error").is_some() => ELICITATION_FAILED_REASON,
+                    None => ELICITATION_FAILED_REASON,
+                    _ => ELICITATION_DISMISSED_REASON,
+                };
+                let params = json!({
+                    "commandId": conn.mint_command_id(),
+                    "sessionId": msp_sid,
+                    "userInputId": pending.user_input_id,
+                    "reason": reason,
+                });
+                match conn.command_with_retry("userInput/cancel", &params).await {
+                    Ok(_) => tracing::info!(
+                        acp_sid,
+                        "elicitation declined/cancelled/failed; question cancelled"
+                    ),
+                    Err(error) => tracing::warn!(
+                        acp_sid,
+                        kind = error.kind(),
+                        message = %error.message,
+                        "userInput/cancel failed"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `userInput/cancel` on the bridge's own initiative (no client surface
+    /// or an unbridgeable prompt). Loud with the durable id.
+    async fn cancel_user_input(&self, acp_sid: &str, params: &Value, reason: &str) {
+        let user_input_id = params
+            .get("userInputId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let msp_sid = {
+            let from_params = session_of("userInput/request", params);
+            if !from_params.is_empty() {
+                from_params
+            } else {
+                let inner = self.inner.lock().await;
+                inner
+                    .sessions
+                    .get(acp_sid)
+                    .map(|s| s.msp_sid.clone())
+                    .unwrap_or_default()
+            }
+        };
+        let Ok(conn) = self.ready_conn().await else {
+            tracing::warn!(
+                acp_sid,
+                user_input_id,
+                "userInput cancel unreachable; prompt will time out server-side"
+            );
+            return;
+        };
+        let cancel_params = json!({
+            "commandId": conn.mint_command_id(),
+            "sessionId": msp_sid,
+            "userInputId": user_input_id,
+            "reason": reason,
+        });
+        match conn
+            .command_with_retry("userInput/cancel", &cancel_params)
+            .await
+        {
+            Ok(_) => tracing::info!(
+                acp_sid,
+                user_input_id,
+                "auto-cancelled a user-input prompt (fail closed)"
+            ),
+            Err(error) => tracing::warn!(
+                acp_sid,
+                user_input_id,
+                kind = error.kind(),
+                message = %error.message,
+                "user-input auto-cancel failed; prompt will time out server-side"
+            ),
+        }
+    }
+
+    /// `approval/listPending` after a resume: present every pending
+    /// approval/user-input the live stream has not already shown (dedupe by
+    /// id resolves pull-vs-reissue races to one dialog). A log-fold read —
+    /// no `commandId`.
+    async fn reconcile_pending(self: &Arc<Self>, acp_sid: &str) {
+        let msp_sid = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => s.msp_sid.clone(),
+                None => return,
+            }
+        };
+        let Ok(conn) = self.ready_conn().await else {
+            return;
+        };
+        let listed = match conn
+            .command_with_retry("approval/listPending", &json!({"sessionId": msp_sid}))
+            .await
+        {
+            Ok(listed) => listed,
+            Err(error) => {
+                tracing::warn!(
+                    acp_sid,
+                    kind = error.kind(),
+                    message = %error.message,
+                    "approval/listPending reconciliation failed"
+                );
+                return;
+            }
+        };
+        let mut n = 0usize;
+        if let Some(approvals) = listed.get("approvals").and_then(Value::as_array) {
+            for approval in approvals.clone() {
+                self.open_approval(acp_sid, &approval).await;
+                n += 1;
+            }
+        }
+        if let Some(inputs) = listed.get("userInputs").and_then(Value::as_array) {
+            for input in inputs.clone() {
+                self.route_user_input(acp_sid, &input).await;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            tracing::info!(acp_sid, presented = n, "pending requests reconciled");
+        }
+    }
+
     /// One catalog fetch for the model selector: a failed fetch degrades
     /// to an empty selector (the retain-last-good cache covers flaps).
     async fn selector_models(&self, method: &str) -> Vec<(String, String)> {
@@ -1273,11 +2908,11 @@ impl SessionStore {
     }
 }
 
-/// Prompt admission outcome: `/compact` settles inline, anything else
-/// spawns a [`drive_prompt`] task.
+/// Prompt admission outcome: protocol commands settle inline, anything
+/// else spawns a [`drive_prompt`] task.
 enum PromptAdmit {
-    /// The `/compact` protocol command ran and settled inline.
-    Compact,
+    /// A protocol command (`/compact`, `/help`, …) ran and settled inline.
+    Settled,
     /// A turn was admitted; drive it to its terminal.
     Driver(PromptDriver),
 }
@@ -1405,19 +3040,23 @@ async fn drive_prompt(store: Arc<SessionStore>, mut ctx: PromptDriver) {
                             continue;
                         }
                         match method.as_str() {
-                            // Fail closed like the HTTP surface (no
-                            // permission/elicitation surface in P4).
+                            // The session observer owns dialogs; drivers
+                            // delegate too so an observer that died (e.g.
+                            // during a host outage) can't strand a turn —
+                            // both paths dedupe by request id.
                             "approval/request" => {
-                                decide_approval(
-                                    &ctx.conn,
-                                    &ctx.msp_sid,
-                                    &ctx.turn_id,
-                                    &params,
-                                )
-                                .await;
+                                let store = Arc::clone(&store);
+                                let sid = ctx.acp_sid.clone();
+                                tokio::spawn(async move {
+                                    store.open_approval(&sid, &params).await;
+                                });
                             }
                             "userInput/request" => {
-                                cancel_user_input(&ctx.conn, &ctx.msp_sid, &params).await;
+                                let store = Arc::clone(&store);
+                                let sid = ctx.acp_sid.clone();
+                                tokio::spawn(async move {
+                                    store.route_user_input(&sid, &params).await;
+                                });
                             }
                             _ => {}
                         }
@@ -1671,131 +3310,6 @@ fn is_approving_decision(decision: &str) -> bool {
     decision.to_lowercase().starts_with("approv")
 }
 
-/// Fail-closed fallback choice (reference `fallback_deny`): the FIRST
-/// non-approving choice id, skipping choices without an id. `None` when
-/// every choice approves (or none is decidable) — the caller must fail
-/// closed (cancel the turn), never synthesize approval.
-fn fallback_deny_choice(choices: &[Value]) -> Option<&str> {
-    choices.iter().find_map(|choice| {
-        let decision = choice.get("decision").and_then(Value::as_str).unwrap_or("");
-        if is_approving_decision(decision) {
-            return None;
-        }
-        choice
-            .get("choiceId")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-    })
-}
-
-/// Fail-closed approval auto-decision (AGENTS rule 11): the FIRST
-/// non-approving choice, else `turn/cancel`. Loud in logs with the durable
-/// id. Never synthesize approval.
-async fn decide_approval(conn: &MspConnection, session_id: &str, turn_id: &str, params: &Value) {
-    let approval_id = params
-        .get("approvalId")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    // Hoisted out of the `tracing` field position below (`tracing::Value`
-    // shadows `serde_json::Value` inside the macro expansion).
-    let tool_name = params
-        .get("toolName")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if approval_id.is_empty() {
-        tracing::warn!(
-            session_id,
-            tool = tool_name,
-            "approval request without an approvalId; cancelling the turn rather than decide blind"
-        );
-        cancel_turn(conn, session_id, turn_id).await;
-        return;
-    }
-    let choices = params
-        .get("availableChoices")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    match fallback_deny_choice(&choices) {
-        Some(choice_id) => {
-            let requirement = params
-                .get("currentRequirementId")
-                .cloned()
-                .unwrap_or(Value::Null);
-            let decide_params = json!({
-                "commandId": conn.mint_command_id(),
-                "sessionId": session_id,
-                "approvalId": approval_id,
-                "requirementId": requirement,
-                "choiceId": choice_id,
-            });
-            match conn
-                .command_with_retry("approval/decide", &decide_params)
-                .await
-            {
-                Ok(_) => tracing::warn!(
-                    session_id,
-                    approval_id,
-                    choice_id,
-                    tool = tool_name,
-                    "auto-denied an approval (fail closed; no permission surface)"
-                ),
-                Err(error) => tracing::warn!(
-                    session_id,
-                    approval_id,
-                    choice_id,
-                    kind = error.kind(),
-                    message = %error.message,
-                    "approval auto-decision failed; turn continues"
-                ),
-            }
-        }
-        None => {
-            tracing::warn!(
-                session_id,
-                approval_id,
-                tool = tool_name,
-                "approval offers no deny choice; cancelling the turn rather than approve"
-            );
-            cancel_turn(conn, session_id, turn_id).await;
-        }
-    }
-}
-
-/// `userInput/request` ⇒ auto-`userInput/cancel` (fail closed: P4 has no
-/// elicitation surface). Prompts time out server-side anyway; the cancel
-/// hurries the model-visible cancellation instead of parking the turn.
-async fn cancel_user_input(conn: &MspConnection, session_id: &str, params: &Value) {
-    let user_input_id = params
-        .get("userInputId")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let cancel_params = json!({
-        "commandId": conn.mint_command_id(),
-        "sessionId": session_id,
-        "userInputId": user_input_id,
-        "reason": USER_INPUT_CANCEL_REASON,
-    });
-    match conn
-        .command_with_retry("userInput/cancel", &cancel_params)
-        .await
-    {
-        Ok(_) => tracing::info!(
-            session_id,
-            user_input_id,
-            "auto-cancelled a user-input prompt (fail closed)"
-        ),
-        Err(error) => tracing::warn!(
-            session_id,
-            user_input_id,
-            kind = error.kind(),
-            message = %error.message,
-            "user-input auto-cancel failed; prompt will time out server-side"
-        ),
-    }
-}
-
 /// Best-effort `turn/cancel` with the EXPLICIT turn id.
 ///
 /// `session/cancel` stops all session work with plain-lane cancellation
@@ -1821,6 +3335,230 @@ async fn cancel_turn(conn: &MspConnection, session_id: &str, turn_id: &str) {
             "turn/cancel failed (best effort)"
         ),
     }
+}
+
+/// Per-session host-event observer: folds session notifications into
+/// facts, bridges plan/meta/usage updates, and owns approval/user-input
+/// dialogs via [`SessionStore::observe_event`]. Resubscribes across host
+/// restarts (a restart swaps the broadcast); retires when the session is
+/// removed or the supervisor is exhausted.
+async fn observe_session(store: Arc<SessionStore>, acp_sid: String) {
+    let mut rx = match store.ready_conn().await {
+        Ok(conn) => conn.subscribe(),
+        Err(error) => {
+            tracing::warn!(acp_sid, message = %error.message, "observer could not subscribe; session has no event feed");
+            return;
+        }
+    };
+    loop {
+        match rx.recv().await {
+            Ok(HostEvent::Notification { method, params })
+            | Ok(HostEvent::ServerRequest { method, params }) => {
+                if !store.observe_event(&acp_sid, &method, &params).await {
+                    return;
+                }
+            }
+            // Facts are latest-wins replace-wholesale snapshots: a skipped
+            // batch loses at most one redundant emission.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(acp_sid, skipped, "observer lagged behind host events");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                // This connection died; resubscribe on the restart.
+                match store.ready_conn().await {
+                    Ok(conn) => rx = conn.subscribe(),
+                    Err(error) => {
+                        tracing::warn!(acp_sid, message = %error.message, "observer retiring (host unavailable)");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deny-safe fallback on `(choiceId, decision)` pairs (ported from
+/// `muse-acp` `fallback_deny`): the first non-approving decision, else
+/// `None` — the caller cancels the turn rather than approve.
+fn fallback_deny(choices: &[(String, String)]) -> Option<String> {
+    choices
+        .iter()
+        .find(|(_, d)| !is_approving_decision(d))
+        .map(|(id, _)| id.clone())
+}
+
+/// ACP permission `options` from MSP `availableChoices`; returns the
+/// options array plus `(choiceId, decision)` for reply mapping. (Ported
+/// from `muse-acp` `perm_options`.)
+fn perm_options(params: &Value) -> (Value, Vec<(String, String)>) {
+    let mut options = Vec::new();
+    let mut choices = Vec::new();
+    if let Some(items) = params.get("availableChoices").and_then(Value::as_array) {
+        for choice in items {
+            let id = choice.get("choiceId").and_then(Value::as_str).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let label = choice.get("label").and_then(Value::as_str).unwrap_or(id);
+            let decision = choice.get("decision").and_then(Value::as_str).unwrap_or("");
+            let scope = choice
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("once");
+            options.push(json!({
+                "optionId": id,
+                "name": label,
+                "kind": perm_kind(decision, scope),
+            }));
+            choices.push((id.to_string(), decision.to_string()));
+        }
+    }
+    (Value::Array(options), choices)
+}
+
+/// MSP `(decision, scope)` → ACP permission-option kind (ported from
+/// `muse-acp`): approving decisions are `allow_*`, the rest `reject_*`;
+/// `session`/`localPersistent` scope widens to `*_always`.
+fn perm_kind(decision: &str, scope: &str) -> &'static str {
+    let approved = is_approving_decision(decision);
+    let always =
+        scope.eq_ignore_ascii_case("session") || scope.eq_ignore_ascii_case("localpersistent");
+    match (approved, always) {
+        (true, true) => "allow_always",
+        (true, false) => "allow_once",
+        (false, true) => "reject_always",
+        (false, false) => "reject_once",
+    }
+}
+
+/// `(title, kind)` for a permission's tool-call card from the approval
+/// `subject` (ported from `muse-acp` `open_approval`'s title/kind arms).
+fn approval_presentation(subject: &Value, tool_name: &str) -> (String, &'static str) {
+    let subject_kind = subject.get("kind").and_then(Value::as_str).unwrap_or("");
+    let command = subject.get("command").and_then(Value::as_str);
+    let path = subject.get("path").and_then(Value::as_str);
+    let target = subject.get("target").and_then(Value::as_str);
+    let access = subject.get("access").and_then(Value::as_str);
+    let description = subject.get("description").and_then(Value::as_str);
+    let title = match subject_kind {
+        "shell" | "process" => command.or(description).unwrap_or(tool_name).to_string(),
+        "fileAccess" => match (access, path) {
+            (Some(access), Some(path)) => format!("{access} {path}"),
+            (None, Some(path)) => path.to_string(),
+            (Some(access), None) => access.to_string(),
+            (None, None) => description.unwrap_or(tool_name).to_string(),
+        },
+        "network" => target.or(description).unwrap_or(tool_name).to_string(),
+        _ => command
+            .or(path)
+            .or(target)
+            .or(access)
+            .or(description)
+            .unwrap_or(tool_name)
+            .to_string(),
+    };
+    let kind = match subject_kind {
+        "shell" | "process" => "execute",
+        "fileAccess" => match access.unwrap_or("").to_ascii_lowercase().as_str() {
+            "read" | "list" | "stat" => "read",
+            "search" => "search",
+            "write" | "create" | "append" | "edit" | "modify" => "edit",
+            "delete" | "remove" => "delete",
+            "move" | "rename" => "move",
+            _ => "other",
+        },
+        "network" => "fetch",
+        _ => "other",
+    };
+    (title, kind)
+}
+
+/// Match a client-returned display label back to the original host label
+/// (ported from `muse-acp` `ui_original`).
+fn ui_original(q: &UiQuestion, shown: &str) -> Option<String> {
+    q.display
+        .iter()
+        .position(|d| d == shown)
+        .and_then(|i| q.labels.get(i))
+        .cloned()
+}
+
+/// `plan` update from the folded todo list (replace-wholesale; an empty
+/// list is a cleared plan, not a no-op). `None` items ⇒ no frame (a
+/// malformed list carries no authoritative fact).
+fn plan_frame(acp_sid: &str, items: Option<&[Value]>) -> Option<Value> {
+    let items = items?;
+    let entries: Vec<Value> = items.iter().filter_map(todo_entry).collect();
+    Some(session_update_frame(
+        acp_sid,
+        json!({"sessionUpdate": "plan", "entries": entries}),
+    ))
+}
+
+/// One MSP `TodoItem` → an ACP plan entry (`inProgress`/`completed` map;
+/// every open value stays `pending` — an unknown state never presents as
+/// finished work).
+fn todo_entry(item: &Value) -> Option<Value> {
+    let text = item.get("text").and_then(Value::as_str)?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let status = match item.get("status").and_then(Value::as_str).unwrap_or("") {
+        "inProgress" => "in_progress",
+        "completed" => "completed",
+        _ => "pending",
+    };
+    Some(json!({"content": text, "priority": "medium", "status": status}))
+}
+
+/// `session_info_update` carrying the goal (provider-neutral) and the
+/// namespaced branch observation (`_meta.muse.branch`). `None` when no
+/// meta fact has ever landed (ported from `muse-acp` `send_session_meta`).
+fn session_meta_frame(acp_sid: &str, facts: &SessionFacts) -> Option<Value> {
+    let mut meta = serde_json::Map::new();
+    if let Some(goal) = &facts.goal {
+        meta.insert("goal".to_string(), goal.clone());
+    }
+    if let Some(branch) = &facts.branch {
+        meta.insert("muse".to_string(), json!({"branch": branch}));
+    }
+    if meta.is_empty() {
+        return None;
+    }
+    Some(session_update_frame(
+        acp_sid,
+        json!({"sessionUpdate": "session_info_update", "_meta": Value::Object(meta)}),
+    ))
+}
+
+/// `usage_update` (`{used, size}` + counted-once cumulative totals under
+/// `_meta.museCumulative`; `musePressure` rides context-usage events).
+/// Emits only when both `used` and `size` are known (ported from
+/// `muse-acp` `send_usage`, minus the priced-cost leg).
+fn usage_frame(acp_sid: &str, facts: &SessionFacts, pressure: Option<&str>) -> Option<Value> {
+    let (used, size) = (facts.usage_used, facts.usage_size);
+    let (Some(used), Some(size)) = (used, size) else {
+        return None;
+    };
+    let mut meta = json!({
+        "museCumulative": {
+            "promptTokens": facts.cum_prompt,
+            "outputTokens": facts.cum_output,
+            "totalTokens": facts.cum_total,
+        }
+    });
+    if let Some(p) = pressure {
+        meta["musePressure"] = Value::String(p.to_string());
+    }
+    Some(session_update_frame(
+        acp_sid,
+        json!({
+            "sessionUpdate": "usage_update",
+            "used": used,
+            "size": size,
+            "_meta": meta,
+        }),
+    ))
 }
 
 /// Owning session of a notification (`session/started` nests it).
@@ -1956,6 +3694,186 @@ pub fn is_reasoning_effort(value: &str) -> bool {
     )
 }
 
+/// The eight reasoning tiers in CLI order (`/effort` help + validation).
+const EFFORT_TIERS: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+// ---------------------------------------------------------------------------
+// Protocol commands: slash words the bridge answers itself (P7/P8). They
+// never reach `turn/start`; each settles its prompt inline.
+// ---------------------------------------------------------------------------
+
+/// A parsed protocol command (single text block starting `/name [arg]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtocolCommand {
+    Compact,
+    Help,
+    Status,
+    Usage,
+    Name,
+    Models,
+    Exit,
+    Effort,
+    Recap,
+}
+
+impl ProtocolCommand {
+    /// Canonical slash name (echoes in the user-message replay).
+    fn name(&self) -> &'static str {
+        match self {
+            ProtocolCommand::Compact => "compact",
+            ProtocolCommand::Help => "help",
+            ProtocolCommand::Status => "status",
+            ProtocolCommand::Usage => "usage",
+            ProtocolCommand::Name => "name",
+            ProtocolCommand::Models => "models",
+            ProtocolCommand::Exit => "exit",
+            ProtocolCommand::Effort => "effort",
+            ProtocolCommand::Recap => "recap",
+        }
+    }
+}
+
+/// `(name, description, hint)` rows for the `/help` card.
+const PROTOCOL_COMMANDS: &[(&str, &str, Option<&str>)] = &[
+    ("compact", "Compact the session context", None),
+    ("help", "Show available commands and gestures", None),
+    ("status", "Show session, model, and host status", None),
+    ("usage", "Show token and context-window usage", None),
+    (
+        "name",
+        "Show or set the durable session name",
+        Some("new name"),
+    ),
+    (
+        "models",
+        "List models; `/model <id>` switches",
+        Some("model id"),
+    ),
+    ("effort", "Show or set the reasoning effort", Some("tier")),
+    ("recap", "Show a recap of recent session activity", None),
+    ("exit", "Close this session", None),
+];
+
+/// Parse the accepted echo into a protocol command: a single text block
+/// whose trimmed text is `/<name>` (optionally followed by an argument).
+/// Anything else (multi-block, attached resources, unknown names) is a
+/// prompt, not a command.
+fn protocol_command(echo: &Value) -> Option<(ProtocolCommand, String)> {
+    let text = match echo {
+        Value::Array(blocks) if blocks.len() == 1 => {
+            let only = &blocks[0];
+            if only.get("type").and_then(Value::as_str) != Some("text") {
+                return None;
+            }
+            only.get("text").and_then(Value::as_str)?.trim()
+        }
+        _ => return None,
+    };
+    let rest = text.strip_prefix('/')?;
+    let (name, arg) = match rest.split_once(char::is_whitespace) {
+        Some((n, a)) => (n, a.trim()),
+        None => (rest, ""),
+    };
+    let command = match name {
+        "compact" => ProtocolCommand::Compact,
+        "help" | "commands" => ProtocolCommand::Help,
+        "status" => ProtocolCommand::Status,
+        "usage" | "context" => ProtocolCommand::Usage,
+        "name" | "rename" => ProtocolCommand::Name,
+        "models" | "model" => ProtocolCommand::Models,
+        "exit" | "quit" => ProtocolCommand::Exit,
+        "effort" | "reasoning-effort" => ProtocolCommand::Effort,
+        "recap" => ProtocolCommand::Recap,
+        _ => return None,
+    };
+    Some((command, arg.to_string()))
+}
+
+/// `" <arg>"` for the command echo (empty when no argument was given).
+fn format_args_for(arg: &str) -> String {
+    if arg.is_empty() {
+        String::new()
+    } else {
+        format!(" {arg}")
+    }
+}
+
+/// Clone a session's folded facts (cards render off-lock).
+fn clone_facts(facts: &SessionFacts) -> SessionFacts {
+    SessionFacts {
+        name: facts.name.clone(),
+        goal: facts.goal.clone(),
+        branch: facts.branch.clone(),
+        todos: facts.todos.clone(),
+        cum_prompt: facts.cum_prompt,
+        cum_output: facts.cum_output,
+        cum_total: facts.cum_total,
+        usage_used: facts.usage_used,
+        usage_size: facts.usage_size,
+        usage_pressure: facts.usage_pressure.clone(),
+    }
+}
+
+/// `model` or `host default` for cards (empty means the server picks).
+fn display_model(model: &str) -> &str {
+    if model.is_empty() {
+        "host default"
+    } else {
+        model
+    }
+}
+
+/// `k`-abbreviated thousands for card numbers (12,345 stays readable).
+fn num(n: u64) -> String {
+    if n >= 10_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Shared usage lines for `/status` and `/usage`.
+fn append_usage_lines(out: &mut String, facts: &SessionFacts) {
+    match (facts.usage_used, facts.usage_size) {
+        (Some(used), Some(size)) => {
+            let pct = (used * 100).checked_div(size).unwrap_or(0);
+            let pressure = facts.usage_pressure.as_deref().unwrap_or("?");
+            out.push_str(&format!(
+                "- Context: {} / {} tokens ({pct}%, {pressure})\n",
+                num(used),
+                num(size)
+            ));
+        }
+        (Some(used), None) => {
+            let pressure = facts.usage_pressure.as_deref().unwrap_or("?");
+            out.push_str(&format!("- Context: {} tokens ({pressure})\n", num(used)));
+        }
+        _ => {}
+    }
+    if let Some(total) = facts.cum_total {
+        let prompt = facts.cum_prompt.unwrap_or(0);
+        let output = facts.cum_output.unwrap_or(0);
+        out.push_str(&format!(
+            "- Tokens: {} total ({} prompt · {output} output)\n",
+            num(total),
+            num(prompt)
+        ));
+    }
+}
+
+/// One-line card snippet, char-capped.
+fn truncate(text: &str, cap: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= cap {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(cap).collect();
+    out.push('…');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // ACP shapes (ported from `muse-acp` `acp.rs`, via serde_json)
 // ---------------------------------------------------------------------------
@@ -2011,6 +3929,7 @@ pub fn config_options(
                 {"value": "medium", "name": "Medium"},
                 {"value": "high", "name": "High"},
                 {"value": "xhigh", "name": "Extra High"},
+                {"value": "max", "name": "Max"},
                 {"value": "ultra", "name": "Ultra"},
             ],
         },
@@ -2029,9 +3948,12 @@ pub fn session_modes(current_mode: &str) -> Value {
     })
 }
 
-/// The Muse skills useful from an editor session (v1 `input` is bare-hint,
-/// v2 wraps it as a typed object).
-fn available_commands(ver: u8) -> Value {
+/// The slash commands a session advertises: the protocol commands the
+/// bridge answers itself, `/skill`, then one entry per workspace skill
+/// (P7 — `muse skills list` at session create). When the registry listing
+/// failed or is empty the static fallback set keeps the known commands.
+/// (v1 `input` is bare-hint, v2 wraps it as a typed object.)
+fn available_commands(ver: u8, skills: &[SkillEntry]) -> Value {
     let input = |hint: &str| {
         if ver == 1 {
             json!({"hint": hint})
@@ -2039,60 +3961,88 @@ fn available_commands(ver: u8) -> Value {
             json!({"type": "text", "hint": hint})
         }
     };
-    let commands: &[(&str, &str, Option<&str>)] = &[
-        (
-            "skill",
-            "Invoke a Muse skill",
-            Some("skill id and optional prompt"),
-        ),
-        (
-            "plan",
-            "Create a grounded plan and stop for approval",
-            Some("what to plan"),
-        ),
-        ("compact", "Compact the session context", None),
-        (
-            "doctor",
-            "Diagnose a Muse runtime or session issue",
-            Some("symptom or session"),
-        ),
-        (
-            "create-skill",
-            "Create a Muse skill",
-            Some("what the skill should do"),
-        ),
-        (
-            "create-plugin",
-            "Create a Muse plugin",
-            Some("what the plugin should do"),
-        ),
-        (
-            "import",
-            "Import another agent's session",
-            Some("transcript, path, or session id"),
-        ),
-    ];
-    Value::Array(
-        commands
-            .iter()
-            .map(|(name, description, hint)| {
-                let mut item = json!({"name": name, "description": description});
-                if let Some(hint) = hint {
-                    item["input"] = input(hint);
-                }
-                item
-            })
-            .collect(),
-    )
+    let mut commands: Vec<Value> = PROTOCOL_COMMANDS
+        .iter()
+        .map(|(name, description, hint)| {
+            let mut item = json!({"name": name, "description": description});
+            if let Some(hint) = hint {
+                item["input"] = input(hint);
+            }
+            item
+        })
+        .collect();
+    commands.push(json!({
+        "name": "skill",
+        "description": "Invoke a Muse skill",
+        "input": input("skill id and optional prompt"),
+    }));
+    let mut names: HashSet<&str> = PROTOCOL_COMMANDS.iter().map(|(n, _, _)| *n).collect();
+    names.insert("skill");
+    // Dynamic skills: `/<id>` normalizes to `/skill <id>` on the way out.
+    // A registry miss degrades to the curated fallback so the palette is
+    // never empty.
+    if skills.is_empty() {
+        for (name, description, hint) in [
+            (
+                "plan",
+                "Create a grounded plan and stop for approval",
+                Some("what to plan"),
+            ),
+            (
+                "doctor",
+                "Diagnose a Muse runtime or session issue",
+                Some("symptom or session"),
+            ),
+            (
+                "create-skill",
+                "Create a Muse skill",
+                Some("what the skill should do"),
+            ),
+            (
+                "create-plugin",
+                "Create a Muse plugin",
+                Some("what the plugin should do"),
+            ),
+            (
+                "import",
+                "Import another agent's session",
+                Some("transcript, path, or session id"),
+            ),
+        ] {
+            if !names.insert(name) {
+                continue;
+            }
+            let mut item = json!({"name": name, "description": description});
+            if let Some(hint) = hint {
+                item["input"] = input(hint);
+            }
+            commands.push(item);
+        }
+    } else {
+        for skill in skills {
+            if skill.id.is_empty() || !names.insert(skill.id.as_str()) {
+                continue;
+            }
+            commands.push(json!({
+                "name": skill.id,
+                "description": if skill.description.is_empty() {
+                    "Muse skill"
+                } else {
+                    skill.description.as_str()
+                },
+            }));
+        }
+    }
+    Value::Array(commands)
 }
 
 /// `available_commands_update` notification frame.
-fn available_commands_frame(acp_sid: &str, ver: u8) -> Value {
+fn available_commands_frame(acp_sid: &str, ver: u8, skills: &[SkillEntry]) -> Value {
     session_update_frame(
         acp_sid,
         json!({
             "sessionUpdate": "available_commands_update",
-            "availableCommands": available_commands(ver),
+            "availableCommands": available_commands(ver, skills),
         }),
     )
 }
@@ -2470,8 +4420,13 @@ fn air_fingerprint(text: &str) -> String {
 ///
 /// Returns the host input plus the accepted prompt re-serialized as ACP
 /// content for the user-message echo (client text verbatim — slash
-/// normalization applies to host input only).
-pub fn extract_prompt(prompt: Option<&Value>, cwd: &str) -> Result<(TurnInput, Value), AcpError> {
+/// normalization applies to host input only). `skills` is the session's
+/// registry so `/<id>` normalizes to `/skill <id>` (P7).
+pub fn extract_prompt(
+    prompt: Option<&Value>,
+    cwd: &str,
+    skills: &[SkillEntry],
+) -> Result<(TurnInput, Value), AcpError> {
     let invalid = |message: String| AcpError::invalid_params(message);
     let blocks = match prompt {
         Some(Value::Array(blocks)) => blocks.clone(),
@@ -2489,7 +4444,7 @@ pub fn extract_prompt(prompt: Option<&Value>, cwd: &str) -> Result<(TurnInput, V
         if texts.is_empty() {
             return;
         }
-        let text = normalize_muse_slash_command(&texts.join("\n"));
+        let text = normalize_muse_slash_command(&texts.join("\n"), skills);
         // Merge with a preceding text run (text runs are contiguous).
         match parts.last_mut() {
             Some(InputPart::Text(run)) => {
@@ -2610,24 +4565,6 @@ pub fn extract_prompt(prompt: Option<&Value>, cwd: &str) -> Result<(TurnInput, V
         },
         Value::Array(content),
     ))
-}
-
-/// Whether the accepted echo content is the `/compact` protocol command: a
-/// single text block whose trimmed text is exactly `/compact`.
-fn is_compact_command(echo: &Value) -> bool {
-    match echo {
-        Value::Array(blocks) if blocks.len() == 1 => {
-            let only = &blocks[0];
-            only.get("type").and_then(Value::as_str) == Some("text")
-                && only
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    == "/compact"
-        }
-        _ => false,
-    }
 }
 
 /// Validate an inline base64 image part (mime + size + decodability — the
@@ -2826,24 +4763,28 @@ fn looks_textual(uri: &str) -> bool {
 
 /// Short editor commands map to Muse's stable skill invocation syntax.
 /// Clients use a leading space to escape execution; only a slash in byte
-/// position zero normalizes. (Ported from `muse-acp`.)
-fn normalize_muse_slash_command(text: &str) -> String {
+/// position zero normalizes. The static list covers a missing registry;
+/// a listed workspace skill id also normalizes (P7). (Ported and extended
+/// from `muse-acp`.)
+fn normalize_muse_slash_command(text: &str, skills: &[SkillEntry]) -> String {
     if !text.starts_with('/') {
         return text.to_string();
     }
     let mut words = text.splitn(2, char::is_whitespace);
     let command = words.next().unwrap_or_default();
     let argument = words.next().unwrap_or_default().trim();
-    match command {
-        "/plan" | "/doctor" | "/create-skill" | "/create-plugin" | "/import" => {
-            let skill = command.trim_start_matches('/');
-            if argument.is_empty() {
-                format!("/skill {skill}")
-            } else {
-                format!("/skill {skill} {argument}")
-            }
-        }
-        _ => text.to_string(),
+    let id = command.trim_start_matches('/');
+    let is_skill = matches!(
+        command,
+        "/plan" | "/doctor" | "/create-skill" | "/create-plugin" | "/import"
+    ) || skills.iter().any(|s| s.id == id);
+    if !is_skill {
+        return text.to_string();
+    }
+    if argument.is_empty() {
+        format!("/skill {id}")
+    } else {
+        format!("/skill {id} {argument}")
     }
 }
 
@@ -2869,10 +4810,10 @@ mod tests {
 
     #[test]
     fn fallback_deny_picks_the_first_non_approving_choice() {
-        let choices = |decisions: &[(&str, &str)]| -> Vec<Value> {
+        let choices = |decisions: &[(&str, &str)]| -> Vec<(String, String)> {
             decisions
                 .iter()
-                .map(|(id, decision)| json!({"choiceId": id, "decision": decision}))
+                .map(|(id, decision)| (id.to_string(), decision.to_string()))
                 .collect()
         };
         // Approving decisions (any case, any `approv*` suffix) are skipped.
@@ -2882,17 +4823,21 @@ mod tests {
             ("c-deny", "deny"),
             ("c-later", "deny"),
         ]);
-        assert_eq!(fallback_deny_choice(&mixed), Some("c-deny"));
+        assert_eq!(fallback_deny(&mixed).as_deref(), Some("c-deny"));
         // An open decision vocabulary counts as non-approving (fail closed).
         let future = choices(&[("c-future", "quarantine")]);
-        assert_eq!(fallback_deny_choice(&future), Some("c-future"));
-        // Choices without an id are skipped, not decided blind.
-        let unlisted = choices(&[("", "deny"), ("c-real", "deny")]);
-        assert_eq!(fallback_deny_choice(&unlisted), Some("c-real"));
+        assert_eq!(fallback_deny(&future).as_deref(), Some("c-future"));
         // All-approve (or empty) fails closed upstream: no choice returned.
         let all_approve = choices(&[("c-a", "approve"), ("c-b", "approveForSession")]);
-        assert_eq!(fallback_deny_choice(&all_approve), None);
-        assert_eq!(fallback_deny_choice(&[]), None);
+        assert_eq!(fallback_deny(&all_approve), None);
+        assert_eq!(fallback_deny(&[]), None);
+        // `perm_options` drops id-less choices before this runs, so the deny
+        // fallback can never decide a choice it cannot name.
+        let (options, mapped) = perm_options(&json!({
+            "availableChoices": [{"decision": "deny"}, {"choiceId": "c-real", "decision": "deny"}]
+        }));
+        assert_eq!(options.as_array().unwrap().len(), 1);
+        assert_eq!(fallback_deny(&mapped).as_deref(), Some("c-real"));
         assert!(!is_approving_decision("deny"));
         assert!(is_approving_decision("ApproveOnce"));
     }
@@ -2931,6 +4876,24 @@ mod tests {
     }
 
     #[test]
+    fn effort_picker_advertises_all_8_tiers_in_cli_order() {
+        let models = vec![("m1".to_string(), "M One".to_string())];
+        let want = [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ];
+        for ver in [1u8, 2u8] {
+            let options = config_options(ver, "ask", "m1", "medium", &models);
+            let tiers: Vec<&str> = options[2]["options"]
+                .as_array()
+                .expect("effort options")
+                .iter()
+                .map(|o| o["value"].as_str().expect("tier value"))
+                .collect();
+            assert_eq!(tiers, want, "v{ver} effort picker");
+        }
+    }
+
+    #[test]
     fn legacy_modes_carry_the_current_mode() {
         let modes = session_modes("deny");
         assert_eq!(modes["currentModeId"], Value::String("deny".to_string()));
@@ -2938,20 +4901,67 @@ mod tests {
     }
 
     #[test]
-    fn available_commands_advertise_seven_skills() {
+    fn available_commands_list_protocol_skills_and_fallback() {
+        let names = |commands: &Value| -> Vec<String> {
+            commands
+                .as_array()
+                .expect("command array")
+                .iter()
+                .filter_map(|c| c["name"].as_str().map(str::to_string))
+                .collect()
+        };
         for ver in [1u8, 2u8] {
-            let commands = available_commands(ver);
-            let items = commands.as_array().expect("command array");
-            assert_eq!(items.len(), 7);
-            assert_eq!(items[0]["name"], Value::String("skill".to_string()));
+            let empty = available_commands(ver, &[]);
+            let names_empty = names(&empty);
+            // Nine protocol commands, the `skill` verb, then the curated
+            // fallback row when the registry misses.
+            assert_eq!(names_empty.len(), PROTOCOL_COMMANDS.len() + 1 + 5);
+            assert_eq!(names_empty[0], "compact");
+            assert!(names_empty.contains(&"skill".to_string()));
+            assert!(names_empty.contains(&"plan".to_string()));
+            // A populated registry replaces the fallback rows.
+            let skills = [
+                SkillEntry {
+                    id: "every-skill".to_string(),
+                    description: "Browse skills".to_string(),
+                },
+                SkillEntry {
+                    id: "compact".to_string(),
+                    description: "shadowed by the protocol command".to_string(),
+                },
+                SkillEntry {
+                    id: "every-skill".to_string(),
+                    description: "duplicate".to_string(),
+                },
+            ];
+            let dynamic = available_commands(ver, &skills);
+            let names_dyn = names(&dynamic);
+            assert_eq!(names_dyn.len(), PROTOCOL_COMMANDS.len() + 1 + 1);
+            assert!(names_dyn.contains(&"every-skill".to_string()));
+            assert!(!names_dyn.contains(&"plan".to_string()));
+            assert_eq!(
+                names_dyn.iter().filter(|n| *n == "compact").count(),
+                1,
+                "skill id shadowed by a protocol command is not duplicated"
+            );
         }
         // v1 input is a bare hint; v2 wraps it as a typed object.
+        let v1 = available_commands(1, &[]);
+        let v2 = available_commands(2, &[]);
+        let skill_at = |commands: &Value| -> usize {
+            commands
+                .as_array()
+                .unwrap()
+                .iter()
+                .position(|c| c["name"] == "skill")
+                .expect("skill row")
+        };
         assert_eq!(
-            available_commands(1)[0]["input"],
+            v1[skill_at(&v1)]["input"],
             json!({"hint": "skill id and optional prompt"})
         );
         assert_eq!(
-            available_commands(2)[0]["input"],
+            v2[skill_at(&v2)]["input"],
             json!({"type": "text", "hint": "skill id and optional prompt"})
         );
     }
@@ -2985,7 +4995,7 @@ mod tests {
             {"type": "text", "text": "/plan the cache"},
             "second line",
         ]);
-        let (input, echo) = extract_prompt(Some(&prompt), "/tmp").expect("text prompt");
+        let (input, echo) = extract_prompt(Some(&prompt), "/tmp", &[]).expect("text prompt");
         assert_eq!(input.parts.len(), 1);
         assert_eq!(
             input.parts[0],
@@ -3001,7 +5011,7 @@ mod tests {
         );
         // A leading space escapes normalization.
         let prompt = json!([{"type": "text", "text": " /plan the cache"}]);
-        let (input, _) = extract_prompt(Some(&prompt), "/tmp").expect("escaped prompt");
+        let (input, _) = extract_prompt(Some(&prompt), "/tmp", &[]).expect("escaped prompt");
         assert_eq!(
             input.parts[0],
             InputPart::Text(" /plan the cache".to_string())
@@ -3010,21 +5020,23 @@ mod tests {
 
     #[test]
     fn prompt_rejects_empty_audio_and_unknown_blocks() {
-        assert!(extract_prompt(Some(&json!([])), "/tmp").is_err());
-        assert!(extract_prompt(None, "/tmp").is_err());
-        assert!(extract_prompt(Some(&json!({})), "/tmp").is_err());
-        let err = extract_prompt(Some(&json!([{"type": "audio"}])), "/tmp").expect_err("audio");
+        assert!(extract_prompt(Some(&json!([])), "/tmp", &[]).is_err());
+        assert!(extract_prompt(None, "/tmp", &[]).is_err());
+        assert!(extract_prompt(Some(&json!({})), "/tmp", &[]).is_err());
+        let err =
+            extract_prompt(Some(&json!([{"type": "audio"}])), "/tmp", &[]).expect_err("audio");
         assert_eq!(err.code, -32602);
-        let err = extract_prompt(Some(&json!([{"type": "video"}])), "/tmp").expect_err("video");
+        let err =
+            extract_prompt(Some(&json!([{"type": "video"}])), "/tmp", &[]).expect_err("video");
         assert!(err.message.contains("video"));
-        let err = extract_prompt(Some(&json!([[1]])), "/tmp").expect_err("nested");
+        let err = extract_prompt(Some(&json!([[1]])), "/tmp", &[]).expect_err("nested");
         assert_eq!(err.code, -32602);
     }
 
     #[test]
     fn inline_image_parts_validate_mime_and_base64() {
         let prompt = json!([{"type": "image", "data": "aGk=", "mimeType": "image/png"}]);
-        let (input, echo) = extract_prompt(Some(&prompt), "/tmp").expect("image prompt");
+        let (input, echo) = extract_prompt(Some(&prompt), "/tmp", &[]).expect("image prompt");
         assert_eq!(echo, prompt, "non-text blocks echo verbatim");
         assert_eq!(
             input.parts[0],
@@ -3034,11 +5046,11 @@ mod tests {
             }
         );
         let bad = json!([{"type": "image", "data": "!!!", "mimeType": "image/png"}]);
-        assert!(extract_prompt(Some(&bad), "/tmp").is_err());
+        assert!(extract_prompt(Some(&bad), "/tmp", &[]).is_err());
         let bad_mime = json!([{"type": "image", "data": "aGk=", "mimeType": "text/plain"}]);
-        assert!(extract_prompt(Some(&bad_mime), "/tmp").is_err());
+        assert!(extract_prompt(Some(&bad_mime), "/tmp", &[]).is_err());
         let no_source = json!([{"type": "image"}]);
-        assert!(extract_prompt(Some(&no_source), "/tmp").is_err());
+        assert!(extract_prompt(Some(&no_source), "/tmp", &[]).is_err());
     }
 
     #[test]
@@ -3047,17 +5059,17 @@ mod tests {
             {"type": "resource", "resource": {"uri": "mcp://x", "text": "inline body"}},
             {"type": "resource", "resource": {"uri": "mcp://y"}},
         ]);
-        let (input, _) = extract_prompt(Some(&prompt), "/tmp").expect("resources");
+        let (input, _) = extract_prompt(Some(&prompt), "/tmp", &[]).expect("resources");
         assert_eq!(
             input.parts[0],
             InputPart::Text("inline body\n[resource: mcp://y]".to_string())
         );
         let bare = json!([{"type": "resource", "resource": {}}]);
-        assert!(extract_prompt(Some(&bare), "/tmp").is_err());
+        assert!(extract_prompt(Some(&bare), "/tmp", &[]).is_err());
         let non_image = json!([
             {"type": "resource", "resource": {"mimeType": "application/pdf", "blob": "aGk="}},
         ]);
-        assert!(extract_prompt(Some(&non_image), "/tmp").is_err());
+        assert!(extract_prompt(Some(&non_image), "/tmp", &[]).is_err());
     }
 
     #[test]
@@ -3075,7 +5087,7 @@ mod tests {
             {"type": "resource_link", "uri": uri, "name": "note", "mimeType": "text/markdown"},
             {"type": "resource_link", "uri": "file:///does/not/exist.txt", "name": "missing"},
         ]);
-        let (input, _) = extract_prompt(Some(&prompt), "/tmp").expect("links");
+        let (input, _) = extract_prompt(Some(&prompt), "/tmp", &[]).expect("links");
         let InputPart::Text(text) = &input.parts[0] else {
             panic!("links fold to text");
         };
@@ -3107,27 +5119,35 @@ mod tests {
     }
 
     #[test]
-    fn compact_detection_needs_one_bare_slash_command() {
-        assert!(is_compact_command(
-            &json!([{"type": "text", "text": "/compact"}])
-        ));
-        assert!(is_compact_command(
-            &json!([{"type": "text", "text": "  /compact  "}])
-        ));
-        assert!(!is_compact_command(
-            &json!([{"type": "text", "text": "/compact now"}])
-        ));
-        assert!(!is_compact_command(
-            &json!([{"type": "text", "text": "/plan"}])
-        ));
-        assert!(!is_compact_command(&json!([
-            {"type": "text", "text": "/compact"},
-            {"type": "text", "text": "more"},
-        ])));
-        assert!(!is_compact_command(
-            &json!([{"type": "image", "data": "x"}])
-        ));
-        assert!(!is_compact_command(&json!([])));
+    fn protocol_command_needs_one_bare_slash_command() {
+        let parsed = |echo: &Value| protocol_command(echo).map(|(c, _)| c.name());
+        assert_eq!(
+            parsed(&json!([{"type": "text", "text": "/compact"}])),
+            Some("compact")
+        );
+        assert_eq!(
+            parsed(&json!([{"type": "text", "text": "  /compact  "}])),
+            Some("compact")
+        );
+        // Trailing text is the argument, not a different command.
+        assert_eq!(
+            parsed(&json!([{"type": "text", "text": "/compact now"}])),
+            Some("compact")
+        );
+        assert_eq!(parsed(&json!([{"type": "text", "text": "/plan"}])), None);
+        assert_eq!(
+            parsed(&json!([
+                {"type": "text", "text": "/compact"},
+                {"type": "text", "text": "more"},
+            ])),
+            None
+        );
+        assert_eq!(parsed(&json!([{"type": "image", "data": "x"}])), None);
+        assert_eq!(parsed(&json!([])), None);
+        let (cmd, arg) =
+            protocol_command(&json!([{"type": "text", "text": "/name New Session"}])).unwrap();
+        assert_eq!(cmd.name(), "name");
+        assert_eq!(arg, "New Session");
     }
 
     #[test]

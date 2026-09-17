@@ -128,7 +128,7 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ReasoningConfig {
-    /// `none|minimal|low|medium|high|xhigh|max|ultra` (`max`→`ultra`).
+    /// `none|minimal|low|medium|high|xhigh|max|ultra` (tiers pass through verbatim).
     pub effort: Option<String>,
 }
 
@@ -329,7 +329,7 @@ pub async fn translate_responses(request: &ResponsesRequest) -> Result<TurnInput
 }
 
 /// Map a client reasoning effort to the MSP tier vocabulary: tiers pass
-/// through, `max`→`ultra` (SPEC §5.1); unknown values are ignored (logged),
+/// through verbatim (SPEC §5.1); unknown values are ignored (logged),
 /// never fatal.
 pub fn map_reasoning_effort(raw: Option<&str>) -> Option<String> {
     let tier = raw?.trim().to_lowercase();

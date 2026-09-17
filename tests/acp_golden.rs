@@ -510,8 +510,7 @@ const GOLDEN_INITIALIZE_V2: &str = r#"
   }
 }
 "#;
-const GOLDEN_SESSION_NEW_V1: &str = r#"
-[
+const GOLDEN_SESSION_NEW_V1: &str = r#"[
   {
     "jsonrpc": "2.0",
     "method": "session/update",
@@ -519,6 +518,51 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"
       "sessionId": "<acp-sid>",
       "update": {
         "availableCommands": [
+          {
+            "description": "Compact the session context",
+            "name": "compact"
+          },
+          {
+            "description": "Show available commands and gestures",
+            "name": "help"
+          },
+          {
+            "description": "Show session, model, and host status",
+            "name": "status"
+          },
+          {
+            "description": "Show token and context-window usage",
+            "name": "usage"
+          },
+          {
+            "description": "Show or set the durable session name",
+            "input": {
+              "hint": "new name"
+            },
+            "name": "name"
+          },
+          {
+            "description": "List models; `/model <id>` switches",
+            "input": {
+              "hint": "model id"
+            },
+            "name": "models"
+          },
+          {
+            "description": "Show or set the reasoning effort",
+            "input": {
+              "hint": "tier"
+            },
+            "name": "effort"
+          },
+          {
+            "description": "Show a recap of recent session activity",
+            "name": "recap"
+          },
+          {
+            "description": "Close this session",
+            "name": "exit"
+          },
           {
             "description": "Invoke a Muse skill",
             "input": {
@@ -532,10 +576,6 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"
               "hint": "what to plan"
             },
             "name": "plan"
-          },
-          {
-            "description": "Compact the session context",
-            "name": "compact"
           },
           {
             "description": "Diagnose a Muse runtime or session issue",
@@ -648,6 +688,10 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"
               "value": "xhigh"
             },
             {
+              "name": "Max",
+              "value": "max"
+            },
+            {
               "name": "Ultra",
               "value": "ultra"
             }
@@ -678,10 +722,8 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"
       "sessionId": "<acp-sid>"
     }
   }
-]
-"#;
-const GOLDEN_SESSION_NEW_V2: &str = r#"
-[
+]"#;
+const GOLDEN_SESSION_NEW_V2: &str = r#"[
   {
     "jsonrpc": "2.0",
     "method": "session/update",
@@ -689,6 +731,54 @@ const GOLDEN_SESSION_NEW_V2: &str = r#"
       "sessionId": "<acp-sid>",
       "update": {
         "availableCommands": [
+          {
+            "description": "Compact the session context",
+            "name": "compact"
+          },
+          {
+            "description": "Show available commands and gestures",
+            "name": "help"
+          },
+          {
+            "description": "Show session, model, and host status",
+            "name": "status"
+          },
+          {
+            "description": "Show token and context-window usage",
+            "name": "usage"
+          },
+          {
+            "description": "Show or set the durable session name",
+            "input": {
+              "hint": "new name",
+              "type": "text"
+            },
+            "name": "name"
+          },
+          {
+            "description": "List models; `/model <id>` switches",
+            "input": {
+              "hint": "model id",
+              "type": "text"
+            },
+            "name": "models"
+          },
+          {
+            "description": "Show or set the reasoning effort",
+            "input": {
+              "hint": "tier",
+              "type": "text"
+            },
+            "name": "effort"
+          },
+          {
+            "description": "Show a recap of recent session activity",
+            "name": "recap"
+          },
+          {
+            "description": "Close this session",
+            "name": "exit"
+          },
           {
             "description": "Invoke a Muse skill",
             "input": {
@@ -704,10 +794,6 @@ const GOLDEN_SESSION_NEW_V2: &str = r#"
               "type": "text"
             },
             "name": "plan"
-          },
-          {
-            "description": "Compact the session context",
-            "name": "compact"
           },
           {
             "description": "Diagnose a Muse runtime or session issue",
@@ -824,6 +910,10 @@ const GOLDEN_SESSION_NEW_V2: &str = r#"
               "value": "xhigh"
             },
             {
+              "name": "Max",
+              "value": "max"
+            },
+            {
               "name": "Ultra",
               "value": "ultra"
             }
@@ -834,8 +924,7 @@ const GOLDEN_SESSION_NEW_V2: &str = r#"
       "sessionId": "<acp-sid>"
     }
   }
-]
-"#;
+]"#;
 const GOLDEN_V1_PROMPT_FRAMES: &str = r#"
 [
   {
@@ -1002,8 +1091,7 @@ const GOLDEN_TOOL_CALL_REPLAY: &str = r#"
   }
 }
 "#;
-const GOLDEN_COMPACT_V1: &str = r#"
-[
+const GOLDEN_COMPACT_V1: &str = r#"[
   {
     "jsonrpc": "2.0",
     "method": "session/update",
@@ -1020,14 +1108,27 @@ const GOLDEN_COMPACT_V1: &str = r#"
     }
   },
   {
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+      "sessionId": "<acp-sid>",
+      "update": {
+        "content": {
+          "text": "Compacting the session context.",
+          "type": "text"
+        },
+        "sessionUpdate": "agent_message_chunk"
+      }
+    }
+  },
+  {
     "id": 3,
     "jsonrpc": "2.0",
     "result": {
       "stopReason": "end_turn"
     }
   }
-]
-"#;
+]"#;
 const GOLDEN_CONFIG_OPTIONS_V1: &str = r#"
 [
   {
@@ -1098,6 +1199,10 @@ const GOLDEN_CONFIG_OPTIONS_V1: &str = r#"
       {
         "name": "Extra High",
         "value": "xhigh"
+      },
+      {
+        "name": "Max",
+        "value": "max"
       },
       {
         "name": "Ultra",
@@ -1178,6 +1283,10 @@ const GOLDEN_CONFIG_OPTIONS_V2: &str = r#"
       {
         "name": "Extra High",
         "value": "xhigh"
+      },
+      {
+        "name": "Max",
+        "value": "max"
       },
       {
         "name": "Ultra",

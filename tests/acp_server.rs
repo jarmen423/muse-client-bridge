@@ -34,6 +34,24 @@ fn test_config(env: HashMap<&str, String>) -> HostConfig {
     }
 }
 
+/// `fake_muse.sh` as the bin: `skills list --json` answers a canned
+/// registry while serve execs `fake_serve.py` — exercises the dynamic
+/// skill list end to end.
+fn muse_config(env: HashMap<&str, String>) -> HostConfig {
+    HostConfig {
+        bin: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fake_muse.sh")
+            .to_string_lossy()
+            .into_owned(),
+        subcommand: None,
+        serve_args: vec![],
+        cwd: std::env::temp_dir(),
+        extra_env: env.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        timeout_override_ms: None,
+        retry_base_delay_ms: 10,
+    }
+}
+
 /// One connected ACP test client: frames in, frames out, server on a task.
 struct AcpClient {
     /// Client→server writer (drop to send EOF).
@@ -46,7 +64,15 @@ struct AcpClient {
 
 impl AcpClient {
     async fn connect(env: HashMap<&str, String>) -> Self {
-        let supervisor = Supervisor::launch(test_config(env))
+        Self::connect_with(test_config(env)).await
+    }
+
+    async fn connect_muse(env: HashMap<&str, String>) -> Self {
+        Self::connect_with(muse_config(env)).await
+    }
+
+    async fn connect_with(config: HostConfig) -> Self {
+        let supervisor = Supervisor::launch(config)
             .await
             .expect("fake host must launch");
         let dispatcher =
@@ -85,6 +111,27 @@ impl AcpClient {
         let mut seen = Vec::new();
         loop {
             let frame = self.recv().await;
+            let done = want(&frame);
+            seen.push(frame);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    /// Like `recv_until`, but declines every `session/request_permission`
+    /// it sees (fail-closed path exercises the bridge's deny fallback).
+    async fn recv_until_answering(&mut self, want: impl Fn(&Value) -> bool) -> Vec<Value> {
+        let mut seen = Vec::new();
+        loop {
+            let frame = self.recv().await;
+            if frame["method"].as_str() == Some("session/request_permission") {
+                self.send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"outcome": {"outcome": "cancelled"}}}))
+                    .await;
+                seen.push(frame);
+                continue;
+            }
             let done = want(&frame);
             seen.push(frame);
             if done {
@@ -1086,7 +1133,7 @@ async fn v1_session(client: &mut AcpClient, cwd: &std::path::Path) -> String {
 }
 
 #[tokio::test]
-async fn acp_approval_fail_closed_denies_first_non_approving_choice() {
+async fn acp_approval_declined_dialog_denies_first_non_approving_choice() {
     let log = unique_dir("p4appr").join("fake.log");
     let cwd = unique_dir("p4apprcwd");
     let mut env = HashMap::from([("FAKE_SCENARIO", "turn-approval".to_string())]);
@@ -1100,7 +1147,32 @@ async fn acp_approval_fail_closed_denies_first_non_approving_choice() {
             "params": {"sessionId": acp_sid, "prompt": ["do the thing"]}}),
         )
         .await;
-    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    let mut frames = Vec::new();
+    let mut perm_reqs = 0;
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("session/request_permission") {
+            perm_reqs += 1;
+            let options = frame["params"]["options"].as_array().expect("options");
+            assert!(
+                options.iter().any(|o| o["optionId"] == "c-deny"),
+                "the deny choice is an option: {frame:?}"
+            );
+            // Dismiss the dialog: fail closed to the first non-approving
+            // choice rather than park the turn.
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"outcome": {"outcome": "cancelled"}}}))
+                .await;
+            continue;
+        }
+        let done = frame.get("id") == Some(&json!(3));
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(perm_reqs, 1, "one permission dialog for the request");
     assert_eq!(
         frames.last().unwrap()["result"],
         json!({"stopReason": "end_turn"}),
@@ -1139,7 +1211,9 @@ async fn acp_approval_with_no_deny_choice_cancels_the_turn() {
             "params": {"sessionId": acp_sid, "prompt": ["do the thing"]}}),
         )
         .await;
-    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    let frames = client
+        .recv_until_answering(|f| f.get("id") == Some(&json!(3)))
+        .await;
     assert_eq!(
         frames.last().unwrap()["result"],
         json!({"stopReason": "cancelled"}),
@@ -2325,6 +2399,401 @@ async fn acp_caps_omit_subagents_and_air() {
         v2["result"]["_meta"]["steering"]["supported"],
         json!(true),
         "steering stays advertised"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_dynamic_skills_advertise_and_normalize() {
+    let input = unique_dir("skilldyn").join("fake.input");
+    let cwd = unique_dir("skilldyncwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-happy".to_string())]);
+    env.insert("FAKE_INPUT", input.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect_muse(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let commands = frames
+        .iter()
+        .find_map(|f| f["params"]["update"]["availableCommands"].as_array())
+        .expect("available_commands_update frame");
+    let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
+    for want in ["fake-skill", "other-skill", "skill", "help", "status"] {
+        assert!(names.contains(&want), "advertised: {names:?}");
+    }
+    assert!(
+        !names.contains(&"off-skill"),
+        "disabled activations are filtered: {names:?}"
+    );
+    assert!(
+        !names.contains(&"plan"),
+        "a live registry replaces the fallback rows: {names:?}"
+    );
+
+    // `/<id>` normalizes to `/skill <id>` on the way to the host.
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/fake-skill run it"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    let lines = read_input_lines(&input);
+    let started: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["method"] == json!("turn/start"))
+        .collect();
+    assert_eq!(started.len(), 1);
+    assert!(
+        started[0].to_string().contains("/skill fake-skill run it"),
+        "skill id normalizes to the /skill verb: {}",
+        started[0]
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_help_status_and_usage_cards() {
+    let input = unique_dir("cards").join("fake.input");
+    let log = unique_dir("cards").join("fake.log");
+    let cwd = unique_dir("cardscwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_INPUT", input.to_string_lossy().into_owned());
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    env.insert("FAKE_HISTORY", "1".to_string());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    for (id, slash, want) in [
+        (3, "/help", "**Commands**"),
+        (4, "/status", "**Status**"),
+        (5, "/usage", "**Usage**"),
+        (6, "/recap", "seeded"),
+    ] {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                "params": {"sessionId": acp_sid, "prompt": [slash]}}),
+            )
+            .await;
+        let frames = client.recv_until(|f| f.get("id") == Some(&json!(id))).await;
+        assert_eq!(
+            frames.last().unwrap()["result"],
+            json!({"stopReason": "end_turn"}),
+            "{slash} settles end_turn: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| f["params"]["update"]["sessionUpdate"] == "user_message_chunk"),
+            "{slash} echoes the command: {frames:?}"
+        );
+        let card = frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect::<String>();
+        assert!(card.contains(want), "{slash} card has {want}: {card}");
+    }
+    // Protocol commands never reach the host as turns.
+    let lines = read_input_lines(&input);
+    assert!(
+        !lines.iter().any(|l| l["method"] == json!("turn/start")),
+        "cards settle locally: {lines:?}"
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("session/read"),
+        "status/recap read the host: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_name_models_and_effort_call_the_host() {
+    let log = unique_dir("cmds").join("fake.log");
+    let input = unique_dir("cmds").join("fake.input");
+    let cwd = unique_dir("cmdscwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    env.insert("FAKE_INPUT", input.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    for (id, slash, want) in [
+        (
+            3,
+            "/name bridge session",
+            "Session renamed to bridge session.",
+        ),
+        (4, "/models", "fake-a"),
+        (5, "/model fake-a", "Model set to fake-a."),
+        (6, "/effort high", "Reasoning effort set to high."),
+        (7, "/effort", "Reasoning effort: high"),
+        (8, "/effort bogus", "Unknown effort"),
+    ] {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": id, "method": "session/prompt",
+                "params": {"sessionId": acp_sid, "prompt": [slash]}}),
+            )
+            .await;
+        let frames = client.recv_until(|f| f.get("id") == Some(&json!(id))).await;
+        assert_eq!(
+            frames.last().unwrap()["result"],
+            json!({"stopReason": "end_turn"}),
+            "{slash} settles end_turn: {frames:?}"
+        );
+        let card = card_of(&frames);
+        assert!(card.contains(want), "{slash} card has {want}: {card}");
+    }
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    for want in [
+        "session/rename",
+        "name=bridge session",
+        "session/setModel",
+        "model=fake-a",
+        "session/setReasoningEffort",
+        "effort=high",
+    ] {
+        assert!(log_text.contains(want), "host saw {want}: {log_text}");
+    }
+    let lines = read_input_lines(&input);
+    assert!(
+        !lines.iter().any(|l| l["method"] == json!("turn/start")),
+        "host-backed commands still settle locally: {lines:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_exit_closes_the_session() {
+    let cwd = unique_dir("exitcwd");
+    let mut client = AcpClient::connect(HashMap::new()).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/exit"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    // The session is gone: a follow-up prompt fails rather than turning.
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["hello?"]}}),
+        )
+        .await;
+    let err = client.recv().await;
+    assert!(
+        err.get("error").is_some(),
+        "prompt after /exit is a caller error: {err}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_approval_selected_option_decides_it() {
+    let log = unique_dir("selappr").join("fake.log");
+    let cwd = unique_dir("selapprcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-approval".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["do the thing"]}}),
+        )
+        .await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("session/request_permission") {
+            assert_eq!(
+                frame["params"]["toolCall"]["kind"].as_str(),
+                Some("execute"),
+                "shell subject maps to the execute kind: {frame:?}"
+            );
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"outcome": {"outcome": "selected", "optionId": "c-allow"}}}))
+                .await;
+            continue;
+        }
+        let done = frame.get("id") == Some(&json!(3));
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("approval/decide")
+            && log_text.contains("approval=ap-1")
+            && log_text.contains("choice=c-allow"),
+        "the selected option decides verbatim: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_user_input_bridges_to_elicitation() {
+    let log = unique_dir("uiform").join("fake.log");
+    let cwd = unique_dir("uiformcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-userinput-form".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}}}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["ask me later"]}}),
+        )
+        .await;
+    let mut frames = Vec::new();
+    let mut elicitations = 0;
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("elicitation/create") {
+            elicitations += 1;
+            assert_eq!(frame["params"]["mode"].as_str(), Some("form"));
+            // Display labels dedupe: [red, red, blue] → [red, red (2), blue].
+            let labels = frame["params"]["requestedSchema"]["properties"]["q0"]["enum"]
+                .as_array()
+                .expect("enum labels");
+            assert_eq!(
+                labels,
+                &vec![json!("red"), json!("red (2)"), json!("blue")],
+                "duplicate display labels dedupe: {frame:?}"
+            );
+            // "red (2)" maps back to the host's second "red" label.
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"action": "accept", "content": {"q0": "red (2)"}}}))
+                .await;
+            continue;
+        }
+        let done = frame.get("id") == Some(&json!(3));
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(elicitations, 1);
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("userInput/answer") && log_text.contains("selectedLabel"),
+        "the form answer lands as selectedLabel: {log_text}"
+    );
+    assert!(
+        !log_text.contains("userInput/cancel"),
+        "accepted elicitations never cancel: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_user_input_decline_cancels_fail_closed() {
+    let log = unique_dir("uidecline").join("fake.log");
+    let cwd = unique_dir("uideclinecwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-userinput-form".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}}}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["ask me later"]}}),
+        )
+        .await;
+    let mut frames = Vec::new();
+    loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("elicitation/create") {
+            client
+                .send(&json!({"jsonrpc": "2.0", "id": frame["id"].clone(),
+                    "result": {"action": "decline"}}))
+                .await;
+            continue;
+        }
+        let done = frame.get("id") == Some(&json!(3));
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("userInput/cancel"),
+        "a declined form cancels the prompt: {log_text}"
     );
     client.shutdown().await;
 }

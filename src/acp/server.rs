@@ -19,11 +19,13 @@
 //!
 //! [`proto`]: crate::msp::proto
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncWrite};
-use tokio::sync::{Mutex, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::acp::sessions::SessionStore;
 use crate::dispatch::Dispatcher;
@@ -40,6 +42,88 @@ const OUTBOUND_DEPTH: usize = 512;
 /// Outbound frames toward the ACP client (replies + notifications), drained
 /// in send order by the single writer task.
 pub type Outbound = mpsc::Sender<Value>;
+
+/// Server→client request correlation for `session/request_permission` and
+/// `elicitation/create`: mints request ids, registers a oneshot waiter per
+/// request, and resolves waiters when no-method reply frames arrive.
+/// Waiters are user-paced (no timeout — a parked dialog outlives any one
+/// turn) and resolve `Err` when the writer is gone.
+pub struct ClientRequests {
+    outbound: Outbound,
+    next_id: AtomicU64,
+    pending: std::sync::Mutex<HashMap<String, oneshot::Sender<Value>>>,
+}
+
+impl ClientRequests {
+    pub fn new(outbound: Outbound) -> Arc<Self> {
+        Arc::new(Self {
+            outbound,
+            next_id: AtomicU64::new(0),
+            pending: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Send `<prefix>-<n>` request; the receiver yields the client's reply
+    /// frame (result or error both arrive; `Err` means the writer is gone).
+    /// A failed send retracts the waiter so the caller resolves `Err`
+    /// instead of parking forever.
+    pub async fn request(
+        &self,
+        prefix: &str,
+        params: Value,
+        method: &str,
+    ) -> (Value, oneshot::Receiver<Value>) {
+        let id = json!(format!(
+            "{prefix}-{}",
+            self.next_id.fetch_add(1, Ordering::SeqCst) + 1
+        ));
+        let key = serde_json::to_string(&id).unwrap_or_default();
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone(), tx);
+        let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        if self.outbound.send(frame).await.is_err() {
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
+        }
+        (id, rx)
+    }
+
+    /// Drop a waiter without a reply (session closed mid-dialog): the
+    /// receiver resolves `Err` so its completer exits instead of parking.
+    pub fn cancel(&self, id: &Value) {
+        let key = serde_json::to_string(id).unwrap_or_default();
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+    }
+
+    /// Route a no-method client frame to a waiting request. Returns true
+    /// when a pending request claimed it.
+    pub fn resolve(&self, frame: &Value) -> bool {
+        let Some(id) = frame.get("id") else {
+            return false;
+        };
+        let key = serde_json::to_string(id).unwrap_or_default();
+        match self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key)
+        {
+            Some(tx) => {
+                let _ = tx.send(frame.clone());
+                true
+            }
+            None => false,
+        }
+    }
+}
 
 /// Negotiate the ACP protocol version: the client's `protocolVersion`
 /// clamped to [`MAX_PROTOCOL_VERSION`] (missing/unparseable ⇒ 1).
@@ -193,11 +277,12 @@ async fn dispatch_frame(
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
     let is_request = !id.is_null();
     let Some(method) = method else {
-        // No method: a client reply to a server request (none is ever
-        // outstanding — fail-closed approvals need no round-trip) or
-        // garbage. Log and survive; never answer (there is nothing to
-        // correlate, and a bare id without a method is not a request).
-        tracing::debug!("ignoring ACP frame without a method");
+        // No method: a client reply — maybe to our session/request_permission
+        // or elicitation/create. Correlated by id; unclaimed replies and
+        // garbage log-and-survive (rule 7), never answered.
+        if !store.resolve_client_reply(&frame) {
+            tracing::debug!("ignoring ACP frame without a method");
+        }
         return;
     };
     if !is_request {
@@ -241,7 +326,23 @@ async fn handle_request(
         "initialize" => {
             let ver = negotiate_version(params.get("protocolVersion"));
             *version.lock().await = ver;
-            tracing::info!(protocol_version = ver, "acp client initialized");
+            // Both ACP versions can advertise the form elicitation
+            // extension; it gates the userInput → elicitation bridge.
+            let caps = params.get(if ver == 1 {
+                "clientCapabilities"
+            } else {
+                "capabilities"
+            });
+            let elicit_form = caps
+                .and_then(|c| c.get("elicitation"))
+                .and_then(|e| e.get("form"))
+                .is_some_and(Value::is_object);
+            store.set_elicitation_form(elicit_form);
+            tracing::info!(
+                protocol_version = ver,
+                elicitation_form = elicit_form,
+                "acp client initialized"
+            );
             send(outbound, result_frame(id, initialize_result(ver))).await;
         }
         "session/new" => {

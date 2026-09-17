@@ -18,7 +18,28 @@ the next.
 3. [PRD.md](/home/josh/code/muse-client-bridge/PRD.md) — original goals (context only).
 4. `.cache/reference/README.md` — what's cached where.
 
-## Current state (refreshed 2026-09-16, FORK_PLAN P6)
+## Current state (refreshed 2026-09-16, TODO P7–P9 landed)
+
+- **ACP parity:** dynamic skill slash commands (`muse skills list
+  --json` per session workspace, `/<id>` → `/skill <id>`); protocol
+  commands `/help` `/status` `/usage` `/name` `/models` `/exit`
+  `/effort` `/recap` settle inline (never `turn/start`); approvals
+  bridge via `session/request_permission`; user input via
+  `elicitation/create` (gated on the client's `elicitation.form`
+  capability). Per-session observers fold MSP events into facts +
+  ACP updates and resubscribe across host restarts. New surface:
+  `src/acp/skills.rs`, `ClientRequests` in `server.rs`, observer +
+  dialog state machines in `sessions.rs`.
+- **Spike resolved:** the remaining "genuine gaps" are mostly
+  TUI-only — `/side` `/new` `/clear` `/init` `/deep-research`
+  `/memory` `/rules` `/mcp` `/export` have no MSP entry point
+  (findings in TODO.md). Wire-real follow-ups: client
+  `mcpServers` → `SessionConfig.mcpServers`, `/stop` →
+  `turn/cancel`, `/goal` display card.
+- **Gates:** `cargo test` (214 tests), `clippy -D warnings`,
+  `fmt --check`, `cargo build --release` all clean.
+
+### Earlier state (FORK_PLAN P6)
 
 - **Code:** ~14.9k lines of `src/`. Two binaries: `muse-bridge`
   (HTTP P0–P7 per the packets below) + `muse-acp-bridge` (ACP

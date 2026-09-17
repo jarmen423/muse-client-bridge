@@ -355,8 +355,8 @@ Fold rules (from the fold-model guide + `fold.rs`):
   never re-submit provider reasoning verbatim).
 - `displayText`: short `"<method> <model>"` label for transcripts.
 - `reasoningEffort`: map Responses `reasoning.effort`
-  (`none|minimal|low|medium|high|xhigh|ultra` pass through;
-  `max`→`ultra`) and Chat's `reasoning_effort` when present.
+  (`none|minimal|low|medium|high|xhigh|max|ultra` pass through
+  verbatim, OQ1) and Chat's `reasoning_effort` when present.
 - `temperature` and friends: accepted, ignored (MSP has no
   per-turn sampler surface) — document, don't error.
 
