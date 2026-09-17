@@ -56,17 +56,26 @@ fail-closed.
 The "genuine gaps" spike is resolved — evidence below is from the 1.3.0
 binary strings plus the local MSP schema bundle.
 
-### MSP-backed, worth doing
+### MSP-backed, worth doing — DONE (this change)
 
-- **Client MCP servers** — `SessionConfig.mcpServers` is wire-real: ACP
-  `session/new`'s `mcpServers` maps to `{transport:"stdio", command, args,
-  env}` per name (remote transports exist too). We currently tolerate and
-  drop them; forwarding is a small, honest win.
-- **`/stop`** — `turn/cancel` on the in-flight turn. Marginal: ACP already
-  has `session/cancel`.
-- **`/goal` (read-only card)** — `session/goalChanged` already folds into
-  session facts; a display card is cheap. `/goal edit` has no MSP setter —
-  goal control rides internal `TurnSubmitPayload` fields, not the wire.
+- **Client MCP servers** — DONE: `session/new`'s `mcpServers` forwards
+  into `session/start`'s `config.mcpServers` (stdio entries → their
+  `{transport:"stdio", command, args, env}` arm, URL entries →
+  `streamableHttp`), gated on the `sessionMcp` grant the bridge now
+  requests at `initialize` (ungranted hosts reject construction with
+  `capabilityRequired` — verified live; without the grant the servers
+  drop loudly and the session still succeeds). Unmappable entries
+  warn-and-skip per entry. Observed live: a broken server does NOT
+  fail construction — the session starts idle. Resume/load/fork
+  re-attach, so they keep tolerate-and-ignore.
+- **`/stop`** — DONE: protocol command, best-effort `turn/cancel` on
+  every in-flight turn (shared helper with `session/cancel`), inline
+  card. Idle sessions report "No in-flight turn to stop."
+- **`/goal` (read-only card)** — DONE: renders the folded
+  `session/goalChanged` block (objective/status/percent/current/next).
+  Fixed `status_card`/`recap_card` to read `Goal.objective` (they read
+  `summary|title|text`, which never exist on the wire shape).
+  `/goal edit` still has no MSP setter — out of scope as before.
 
 ### Not bridgeable — the CLI says so itself
 
@@ -85,10 +94,16 @@ binary strings plus the local MSP schema bundle.
 - Cross-session messaging — agent *tools* (`list_peer_sessions`,
   `send_session_message`), not client-callable MSP methods.
 
-### Partially backed — needs a design call before committing
+### Partially backed — `/tasks` done, engines deferred (this change)
 
-- `/tasks` `/workflows` `/subagents` — MSP exposes control ops
-  (`subagent/stop|interrupt|readResult|sendMessage|resume|followupTask|
-  close|reopen`) but **no list method**; membership lives in view items
-  and `session/todoListChanged` (already folded → ACP `plan` updates).
-  A display card is feasible; management UX has no ACP shape.
+- `/tasks` — DONE: protocol command rendering the folded
+  `session/todoListChanged` items (`[x]/[~]/[ ]/[-]` marks, the running
+  item in its `activeForm`). Unknown statuses stay open, never
+  finished — same rule as the ACP `plan` entries.
+- `/workflows` `/subagents` — DEFERRED (no wire to map): MSP exposes
+  control ops (`subagent/stop|interrupt|readResult|sendMessage|resume|
+  followupTask|close|reopen`) but **no list method**, and membership
+  lives in view items the bridge does not retain — there is nothing
+  truthful for a card to show. Management verbs have no ACP shape
+  either. They stay plain prompt text (the model sees them); revisit
+  if MSP gains a list method or ACP gains a subagent surface.

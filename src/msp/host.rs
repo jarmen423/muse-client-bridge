@@ -163,6 +163,16 @@ impl HandshakeInfo {
             .iter()
             .any(|cap| cap == "userShell")
     }
+
+    /// Whether the host granted the `sessionMcp` capability at `initialize`
+    /// (gates `config.mcpServers` on `session/start`: ungranted hosts
+    /// reject construction with `capabilityRequired`, verified live —
+    /// so the ACP layer only forwards client servers on a grant).
+    pub fn supports_session_mcp(&self) -> bool {
+        self.granted_capabilities
+            .iter()
+            .any(|cap| cap == "sessionMcp")
+    }
 }
 
 /// Liveness of one connection (reader-owned, watched by waiters).
@@ -380,7 +390,7 @@ impl MspConnection {
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
-                "requestedCapabilities": ["userShell"],
+                "requestedCapabilities": ["userShell", "sessionMcp"],
             },
         });
         let result = self
@@ -1167,11 +1177,12 @@ mod tests {
             "serverInfo": {"name": "muse-session-server", "version": "1.2.1"},
             "schema": {"version": 1, "fingerprint": PINNED_FINGERPRINT},
             "sessionDurability": "durable",
-            "grantedCapabilities": ["userShell"],
+            "grantedCapabilities": ["userShell", "sessionMcp"],
         });
         let info = classify_handshake(&granted).expect("valid handshake");
         assert_eq!(info.compat, CompatStatus::Tested);
         assert!(info.supports_user_shell());
+        assert!(info.supports_session_mcp());
         assert!(info.restartable());
         // Absent grants read as none; the gate stays fail-closed.
         let bare = serde_json::json!({
@@ -1181,6 +1192,7 @@ mod tests {
         let info = classify_handshake(&bare).expect("valid handshake");
         assert_eq!(info.compat, CompatStatus::FingerprintMismatch);
         assert!(!info.supports_user_shell());
+        assert!(!info.supports_session_mcp());
         assert!(info.restartable(), "absent durability means durable");
         // schema.version != 1 is fatal.
         let bad = serde_json::json!({"schema": {"version": 2}});

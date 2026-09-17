@@ -9,7 +9,8 @@
 //!
 //! Implemented here: new/list/resume/load/fork/close, prompt (incl. the
 //! protocol commands `/compact` `/help` `/status` `/usage` `/name` `/model`
-//! `/exit` `/effort` `/recap`), steering, mode/model/effort selectors, gap
+//! `/exit` `/effort` `/recap` `/stop` `/goal` `/tasks`), steering,
+//! mode/model/effort selectors, gap
 //! page+refold with lag catch-up, permission dialogs
 //! (`session/request_permission`), user questions (`elicitation/create`
 //! when the client advertises `elicitation.form`), dynamic skill commands
@@ -63,7 +64,7 @@ struct InFlight {
     /// ACP request id awaiting the `stopReason` reply (`None` for
     /// steering-started turns, which were already acked `{}`).
     req_id: Option<Value>,
-    /// Cancel flag watched by the driver (set by `session/cancel`/`close`).
+    /// Cancel flag watched by the driver (set by `session/cancel`/`close`/`/stop`).
     cancel_tx: watch::Sender<bool>,
 }
 
@@ -243,7 +244,22 @@ impl SessionStore {
         let approval_mode = resolve_startup_mode()?;
 
         let conn = self.ready_conn().await?;
-        let start_params = start_params(&conn, &approval_mode, workspace_root.as_deref());
+        let mut start_params = start_params(&conn, &approval_mode, workspace_root.as_deref());
+        if let Some(config) = forward_client_mcp_servers(params) {
+            // Ungranted hosts reject `config.mcpServers` at construction
+            // (`capabilityRequired`); drop the servers loudly instead of
+            // failing a session the client could otherwise use.
+            if conn
+                .handshake_info()
+                .is_some_and(|info| info.supports_session_mcp())
+            {
+                start_params["config"] = config;
+            } else {
+                tracing::warn!(
+                    "host did not grant sessionMcp; dropping client MCP servers for this session"
+                );
+            }
+        }
         let start = conn
             .command_with_retry("session/start", &start_params)
             .await
@@ -516,6 +532,9 @@ impl SessionStore {
             ProtocolCommand::Exit => "Session closed.".to_string(),
             ProtocolCommand::Effort => self.run_effort(acp_sid, msp_sid, arg).await?,
             ProtocolCommand::Recap => self.recap_card(acp_sid, msp_sid).await,
+            ProtocolCommand::Stop => self.run_stop(acp_sid).await,
+            ProtocolCommand::Goal => self.goal_card(acp_sid).await,
+            ProtocolCommand::Tasks => self.tasks_card(acp_sid).await,
         };
         self.settle_command(acp_sid, ver, req_id, &echo_text, &card)
             .await;
@@ -723,18 +742,8 @@ impl SessionStore {
         if in_flight > 0 {
             out.push_str(&format!("- In-flight turns: {in_flight}\n"));
         }
-        if let Some(goal) = &facts.goal
-            && !goal.is_null()
-        {
-            let summary = goal
-                .get("summary")
-                .or_else(|| goal.get("title"))
-                .or_else(|| goal.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if !summary.is_empty() {
-                out.push_str(&format!("- Goal: {summary}\n"));
-            }
+        if let Some(goal) = facts.goal.as_ref().and_then(goal_summary) {
+            out.push_str(&format!("- Goal: {goal}\n"));
         }
         if let Some(branch) = facts
             .branch
@@ -764,6 +773,61 @@ impl SessionStore {
         }
         append_usage_lines(&mut out, &facts);
         out
+    }
+
+    /// `/stop`: best-effort `turn/cancel` for every in-flight turn —
+    /// the same settle as `session/cancel`, as an inline card. The
+    /// command itself never starts a turn, so it cannot cancel itself.
+    async fn run_stop(&self, acp_sid: &str) -> String {
+        let turns = {
+            let inner = self.inner.lock().await;
+            inner
+                .sessions
+                .get(acp_sid)
+                .map(|s| {
+                    let msp = s.msp_sid.clone();
+                    s.in_flight
+                        .iter()
+                        .map(|f| (msp.clone(), f.turn_id.clone(), f.cancel_tx.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        if turns.is_empty() {
+            return "No in-flight turn to stop.".to_string();
+        }
+        let stopped = turns.len();
+        self.cancel_turns(acp_sid, turns).await;
+        tracing::info!(acp_sid, stopped, "/stop cancelled in-flight turns");
+        if stopped == 1 {
+            "Stopped 1 turn.".to_string()
+        } else {
+            format!("Stopped {stopped} turns.")
+        }
+    }
+
+    /// `/goal`: the folded `session/goalChanged` block, read-only.
+    async fn goal_card(&self, acp_sid: &str) -> String {
+        let goal = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => s.facts.goal.clone(),
+                None => return "Goal unavailable: unknown session.".to_string(),
+            }
+        };
+        render_goal_card(&goal)
+    }
+
+    /// `/tasks`: the folded `session/todoListChanged` list, read-only.
+    async fn tasks_card(&self, acp_sid: &str) -> String {
+        let todos = {
+            let inner = self.inner.lock().await;
+            match inner.sessions.get(acp_sid) {
+                Some(s) => s.facts.todos.clone(),
+                None => return "Tasks unavailable: unknown session.".to_string(),
+            }
+        };
+        render_tasks_card(&todos)
     }
 
     /// `/name [name]`: `session/rename` on an argument, or the current name.
@@ -968,18 +1032,8 @@ impl SessionStore {
             out.push_str(&format!(" · {in_flight} in flight"));
         }
         out.push('\n');
-        if let Some(goal) = &facts.goal
-            && !goal.is_null()
-        {
-            let summary = goal
-                .get("summary")
-                .or_else(|| goal.get("title"))
-                .or_else(|| goal.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if !summary.is_empty() {
-                out.push_str(&format!("- Goal: {summary}\n"));
-            }
+        if let Some(goal) = facts.goal.as_ref().and_then(goal_summary) {
+            out.push_str(&format!("- Goal: {goal}\n"));
         }
         let items = result
             .get("history")
@@ -1050,12 +1104,19 @@ impl SessionStore {
             tracing::debug!(acp_sid, "session/cancel with no in-flight prompt");
             return;
         }
+        self.cancel_turns(acp_sid, turns).await;
+    }
+
+    /// Best-effort `turn/cancel` for collected in-flight turns plus the
+    /// local driver poke each one waits on. Shared by `session/cancel`
+    /// and the `/stop` protocol command; never fails.
+    async fn cancel_turns(&self, acp_sid: &str, turns: Vec<(String, String, watch::Sender<bool>)>) {
         let conn = self.ready_conn().await.ok();
         for (msp_sid, turn_id, cancel_tx) in turns {
             if let Some(conn) = &conn {
                 cancel_turn(conn, &msp_sid, &turn_id).await;
             } else {
-                tracing::warn!(acp_sid, turn_id, "session/cancel could not reach the host");
+                tracing::warn!(acp_sid, turn_id, "cancel could not reach the host");
             }
             let _ = cancel_tx.send(true);
         }
@@ -3511,6 +3572,108 @@ fn todo_entry(item: &Value) -> Option<Value> {
     Some(json!({"content": text, "priority": "medium", "status": status}))
 }
 
+/// One-line goal text: the `Goal.objective` (legacy
+/// `summary`/`title`/`text` fallbacks, then compact JSON for
+/// unrecognized shapes). `None` when no goal is set or it cleared.
+fn goal_summary(goal: &Value) -> Option<String> {
+    if goal.is_null() {
+        return None;
+    }
+    if let Some(text) = goal.as_str().filter(|t| !t.trim().is_empty()) {
+        return Some(text.to_string());
+    }
+    goal.get("objective")
+        .or_else(|| goal.get("summary"))
+        .or_else(|| goal.get("title"))
+        .or_else(|| goal.get("text"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| Some(goal.to_string()))
+}
+
+/// `/goal` card body off a folded goal fact (pure; unit-tested).
+fn render_goal_card(goal: &Option<Value>) -> String {
+    let mut out = String::from("**Goal**\n\n");
+    let Some(block) = goal else {
+        out.push_str("No goal has been set for this session.\n");
+        return out;
+    };
+    if block.is_null() {
+        out.push_str("The session goal was cleared.\n");
+        return out;
+    }
+    let Some(summary) = goal_summary(block) else {
+        out.push_str("No goal has been set for this session.\n");
+        return out;
+    };
+    out.push_str(&format!("- Objective: {summary}\n"));
+    if let Some(status) = block
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(&format!("- Status: {status}"));
+        if let Some(pct) = block.get("percentComplete").and_then(Value::as_f64) {
+            out.push_str(&format!(" · {pct}%"));
+        }
+        out.push('\n');
+    }
+    for (key, label) in [("currentWork", "Current"), ("nextWork", "Next")] {
+        if let Some(work) = block
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|w| !w.trim().is_empty())
+        {
+            out.push_str(&format!("- {label}: {work}\n"));
+        }
+    }
+    out
+}
+
+/// `/tasks` card body off folded todos (pure; unit-tested).
+fn render_tasks_card(todos: &Option<Vec<Value>>) -> String {
+    let mut out = String::from("**Tasks**\n\n");
+    let Some(items) = todos else {
+        out.push_str("No task list has been reported yet.\n");
+        return out;
+    };
+    let mut shown = 0;
+    for item in items {
+        let text = item
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+        // Unknown states stay open — never present as finished work.
+        let mark = match status {
+            "completed" => "x",
+            "inProgress" => "~",
+            "cancelled" => "-",
+            _ => " ",
+        };
+        // The running item reads better in its present-tense form.
+        let label = if status == "inProgress" {
+            item.get("activeForm")
+                .and_then(Value::as_str)
+                .filter(|f| !f.trim().is_empty())
+                .unwrap_or(text)
+        } else {
+            text
+        };
+        out.push_str(&format!("- [{mark}] {label}\n"));
+        shown += 1;
+    }
+    if shown == 0 {
+        out.push_str("The task list is empty.\n");
+    }
+    out
+}
+
 /// `session_info_update` carrying the goal (provider-neutral) and the
 /// namespaced branch observation (`_meta.muse.branch`). `None` when no
 /// meta fact has ever landed (ported from `muse-acp` `send_session_meta`).
@@ -3716,6 +3879,9 @@ enum ProtocolCommand {
     Exit,
     Effort,
     Recap,
+    Stop,
+    Goal,
+    Tasks,
 }
 
 impl ProtocolCommand {
@@ -3731,6 +3897,9 @@ impl ProtocolCommand {
             ProtocolCommand::Exit => "exit",
             ProtocolCommand::Effort => "effort",
             ProtocolCommand::Recap => "recap",
+            ProtocolCommand::Stop => "stop",
+            ProtocolCommand::Goal => "goal",
+            ProtocolCommand::Tasks => "tasks",
         }
     }
 }
@@ -3753,6 +3922,9 @@ const PROTOCOL_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ),
     ("effort", "Show or set the reasoning effort", Some("tier")),
     ("recap", "Show a recap of recent session activity", None),
+    ("stop", "Stop the in-flight turn", None),
+    ("goal", "Show the session goal", None),
+    ("tasks", "Show the session task list", None),
     ("exit", "Close this session", None),
 ];
 
@@ -3786,6 +3958,9 @@ fn protocol_command(echo: &Value) -> Option<(ProtocolCommand, String)> {
         "exit" | "quit" => ProtocolCommand::Exit,
         "effort" | "reasoning-effort" => ProtocolCommand::Effort,
         "recap" => ProtocolCommand::Recap,
+        "stop" => ProtocolCommand::Stop,
+        "goal" => ProtocolCommand::Goal,
+        "tasks" => ProtocolCommand::Tasks,
         _ => return None,
     };
     Some((command, arg.to_string()))
@@ -4136,8 +4311,108 @@ fn validate_opt_cwd(params: &Value) -> Result<(), AcpError> {
     Ok(())
 }
 
-/// Client-provided MCP servers cannot be forwarded (Muse owns its tool
-/// runtime): tolerate and ignore them instead of aborting the session.
+/// Map client-provided ACP `mcpServers` (`session/new` only) onto the MSP
+/// `config.mcpServers` record (`session/start` construction). ACP stdio
+/// entries (`name` + `command`, the Hermes/`muse-acp` shape) become
+/// `{transport: "stdio", command, args?, env?}`; URL entries become
+/// `{transport: "streamableHttp", url, headers?}`. Env/headers accept the
+/// ACP `[{name, value}]` rows or a plain object map. `None` when nothing
+/// is forwardable (absent, empty, or every entry skipped).
+///
+/// Fail-soft per entry, never per session: clients attach these on every
+/// `session/new`, so an unmappable entry warns loudly and is skipped
+/// instead of bricking session creation. `mode` stays unset (schema
+/// default `required`); observed live, a broken server does NOT fail
+/// construction — the session starts and the breakage surfaces
+/// host-side, outside anything the wire reports back.
+fn forward_client_mcp_servers(params: &Value) -> Option<Value> {
+    let entries = params.get("mcpServers")?.as_array()?;
+    let mut record = serde_json::Map::new();
+    for entry in entries {
+        let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.trim().is_empty() {
+            tracing::warn!(
+                "skipping client MCP server without a name (cannot key config.mcpServers)"
+            );
+            continue;
+        }
+        if let Some(command) = entry
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+        {
+            let mut server = json!({"transport": "stdio", "command": command});
+            if let Some(args) = entry.get("args").and_then(Value::as_array) {
+                let kept: Vec<Value> = args.iter().filter(|a| a.is_string()).cloned().collect();
+                server["args"] = Value::Array(kept);
+            }
+            if let Some(env) = string_record(entry.get("env")) {
+                server["env"] = Value::Object(env);
+            }
+            if record.insert(name.to_string(), server).is_some() {
+                tracing::warn!(name, "duplicate client MCP server name; last entry wins");
+            }
+            continue;
+        }
+        if let Some(url) = entry
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+        {
+            let mut server = json!({"transport": "streamableHttp", "url": url});
+            if let Some(headers) = string_record(entry.get("headers")) {
+                server["headers"] = Value::Object(headers);
+            }
+            if record.insert(name.to_string(), server).is_some() {
+                tracing::warn!(name, "duplicate client MCP server name; last entry wins");
+            }
+            continue;
+        }
+        tracing::warn!(
+            name,
+            "skipping client MCP server with neither command nor url (no MSP transport arm)"
+        );
+    }
+    if record.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = record.keys().map(String::as_str).collect();
+    tracing::info!(
+        names = names.join(","),
+        "forwarding client MCP servers to session construction"
+    );
+    Some(json!({"mcpServers": Value::Object(record)}))
+}
+
+/// ACP `[{name, value}]` rows (or a plain object map) → an MSP string
+/// record. `None` when absent or nothing usable survives.
+fn string_record(value: Option<&Value>) -> Option<serde_json::Map<String, Value>> {
+    let value = value?;
+    let mut record = serde_json::Map::new();
+    if let Some(obj) = value.as_object() {
+        for (key, val) in obj {
+            if let Some(text) = val.as_str() {
+                record.insert(key.clone(), Value::String(text.to_string()));
+            }
+        }
+    } else {
+        let rows = value.as_array()?;
+        for row in rows {
+            let name = row.get("name").and_then(Value::as_str).unwrap_or("");
+            // Empty values are legal env (set-but-empty); empty names are not.
+            let val = row.get("value").and_then(Value::as_str).unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            record.insert(name.to_string(), Value::String(val.to_string()));
+        }
+    }
+    (!record.is_empty()).then_some(record)
+}
+
+/// `session/new` forwards client MCP servers at construction; resume, load,
+/// and fork re-attach an existing session, so there is nothing to attach
+/// to — tolerate and ignore them instead of aborting the session.
 fn ignore_client_mcp_servers(params: &Value) {
     if params
         .get("mcpServers")
@@ -4913,7 +5188,7 @@ mod tests {
         for ver in [1u8, 2u8] {
             let empty = available_commands(ver, &[]);
             let names_empty = names(&empty);
-            // Nine protocol commands, the `skill` verb, then the curated
+            // Twelve protocol commands, the `skill` verb, then the curated
             // fallback row when the registry misses.
             assert_eq!(names_empty.len(), PROTOCOL_COMMANDS.len() + 1 + 5);
             assert_eq!(names_empty[0], "compact");
@@ -5148,6 +5423,146 @@ mod tests {
             protocol_command(&json!([{"type": "text", "text": "/name New Session"}])).unwrap();
         assert_eq!(cmd.name(), "name");
         assert_eq!(arg, "New Session");
+        for slash in ["/stop", "/goal", "/tasks"] {
+            assert_eq!(
+                parsed(&json!([{"type": "text", "text": slash}])),
+                Some(slash.trim_start_matches('/')),
+                "{slash} parses"
+            );
+        }
+        // The unmappable engine surfaces stay prompts, not commands.
+        for slash in ["/workflows", "/subagents", "/side", "/mcp"] {
+            assert_eq!(
+                parsed(&json!([{"type": "text", "text": slash}])),
+                None,
+                "{slash} is not a protocol command"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_forwarding_maps_stdio_and_http() {
+        let config = forward_client_mcp_servers(&json!({
+            "mcpServers": [
+                {"name": "files", "command": "mcp-files", "args": ["--root", 7],
+                 "env": [{"name": "HOME", "value": "/r"}, {"name": "", "value": "x"}]},
+                {"name": "web", "url": "https://mcp.example/s",
+                 "headers": {"Authorization": "Bearer t", "n": 1}},
+            ]
+        }))
+        .expect("forwardable entries");
+        assert_eq!(
+            config,
+            json!({"mcpServers": {
+                "files": {"transport": "stdio", "command": "mcp-files",
+                          "args": ["--root"], "env": {"HOME": "/r"}},
+                "web": {"transport": "streamableHttp", "url": "https://mcp.example/s",
+                        "headers": {"Authorization": "Bearer t"}},
+            }})
+        );
+    }
+
+    #[test]
+    fn mcp_forwarding_skips_soft_and_omits_config() {
+        assert_eq!(forward_client_mcp_servers(&json!({})), None);
+        assert_eq!(forward_client_mcp_servers(&json!({"mcpServers": []})), None);
+        // Nameless, transportless, and junk entries skip; the survivor
+        // still forwards and the session is never at risk.
+        let config = forward_client_mcp_servers(&json!({"mcpServers": [
+            {"command": "noname"},
+            {"name": "sse-only"},
+            {"name": 7, "command": "junk"},
+            {"name": "ok", "command": "yes"},
+        ]}))
+        .expect("survivor forwards");
+        assert_eq!(
+            config,
+            json!({"mcpServers": {"ok": {"transport": "stdio", "command": "yes"}}})
+        );
+        assert_eq!(
+            forward_client_mcp_servers(&json!({"mcpServers": [{"name": "nope"}]})),
+            None,
+            "all skipped ⇒ no config key at all"
+        );
+    }
+
+    #[test]
+    fn goal_summary_reads_objective_first() {
+        assert_eq!(
+            goal_summary(&json!({"objective": "Ship it", "status": "active"})).as_deref(),
+            Some("Ship it")
+        );
+        assert_eq!(goal_summary(&Value::Null), None);
+        assert_eq!(
+            goal_summary(&json!({"summary": "legacy"})).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(
+            goal_summary(&json!({"weird": 1})).as_deref(),
+            Some(r#"{"weird":1}"#),
+            "unrecognized shapes render raw, never blank"
+        );
+    }
+
+    #[test]
+    fn goal_card_renders_states() {
+        let full = render_goal_card(&Some(json!({
+            "objective": "Ship it",
+            "status": "active",
+            "percentComplete": 50,
+            "currentWork": "tests",
+            "nextWork": "docs",
+        })));
+        for want in [
+            "**Goal**",
+            "- Objective: Ship it",
+            "- Status: active · 50%",
+            "- Current: tests",
+            "- Next: docs",
+        ] {
+            assert!(full.contains(want), "card has {want}: {full}");
+        }
+        let bare = render_goal_card(&Some(json!({"objective": "Ship it"})));
+        assert!(bare.contains("- Objective: Ship it"), "{bare}");
+        assert!(!bare.contains("Status:"), "no status line: {bare}");
+        assert!(
+            render_goal_card(&None).contains("No goal has been set"),
+            "unset state"
+        );
+        assert!(
+            render_goal_card(&Some(Value::Null)).contains("was cleared"),
+            "cleared state"
+        );
+    }
+
+    #[test]
+    fn tasks_card_renders_marks_and_active_form() {
+        let card = render_tasks_card(&Some(vec![
+            json!({"text": "done", "status": "completed"}),
+            json!({"text": "Write tests", "status": "inProgress", "activeForm": "Writing tests"}),
+            json!({"text": "todo", "status": "pending"}),
+            json!({"text": "dropped", "status": "cancelled"}),
+            json!({"text": "mystery", "status": "zonked"}),
+            json!({"text": "  ", "status": "pending"}),
+        ]));
+        for want in [
+            "**Tasks**",
+            "- [x] done",
+            "- [~] Writing tests",
+            "- [ ] todo",
+            "- [-] dropped",
+            "- [ ] mystery",
+        ] {
+            assert!(card.contains(want), "card has {want}: {card}");
+        }
+        assert!(
+            render_tasks_card(&None).contains("No task list has been reported"),
+            "unreported state"
+        );
+        assert!(
+            render_tasks_card(&Some(vec![])).contains("empty"),
+            "empty state"
+        );
     }
 
     #[test]

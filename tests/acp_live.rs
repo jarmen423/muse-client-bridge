@@ -168,3 +168,52 @@ async fn live_acp_file_edit_task() {
 
     client.shutdown().await;
 }
+
+/// Live MCP proof: `session/new` carrying `mcpServers` is accepted at
+/// construction. Without the `sessionMcp` grant request the live host
+/// rejects this `capabilityRequired`, so success pins the whole path
+/// (request → grant → forward). No turn runs: session creation alone
+/// proves the wire shape. A broken command is deliberate — observed
+/// live, it does not fail construction.
+#[tokio::test]
+async fn live_acp_mcp_servers_accepted_at_construction() {
+    if !live_enabled() {
+        eprintln!("skipped: set MUSE_LIVE_TESTS=1 for live-host tests");
+        return;
+    }
+    let workspace = std::env::temp_dir().join(format!(
+        "muse-bridge-live-mcp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&workspace).expect("live workspace");
+
+    let mut client = LiveAcp::connect().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {}}}))
+        .await;
+    let init = client.recv().await;
+    assert_eq!(init["result"]["protocolVersion"], json!(1));
+
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": workspace.to_string_lossy(),
+            "mcpServers": [
+                {"name": "live-bogus",
+                 "command": "/nonexistent/mcp-bridge-live-probe"},
+            ]}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let created = frames.last().expect("session/new reply");
+    assert!(
+        created["result"]["sessionId"].is_string(),
+        "config.mcpServers accepted at construction: {created}"
+    );
+    eprintln!(
+        "live mcp session: {}",
+        created["result"]["sessionId"].as_str().unwrap_or("?")
+    );
+
+    client.shutdown().await;
+}

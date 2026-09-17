@@ -330,7 +330,10 @@ Fold rules (from the fold-model guide + `fold.rs`):
   before `turn/start` when it names a known catalog id; unknown
   model strings are passed through as `modelId` verbatim first
   (server default on empty) — record folded `session/modelChanged`
-  as the source of truth, never the echo.
+  as the source of truth, never the echo. A host rejection
+  (`commandRejected`/`invalid_model`, verified live — unknown
+  models do not pass through) fails the request 400
+  `invalid_request_error`/`unknown_model`; the turn never starts.
 - Restart: on host death, if durable (or durability absent ⇒ durable
   read), relaunch ≤3 with 250 ms / 500 ms / 1 s backoff, then fail
   in-flight requests `503 + Retry-After` (v1 has no resume: each
@@ -414,6 +417,7 @@ add a human-in-the-loop endpoint (§8).
 | `terminal=cancelled` (client gone) | (connection already dead) | (connection already dead) | — |
 | `invalidParams` from OUR request build (bug) | `server_error` + log | `response.failed code=server_error` | 500 |
 | Caller 400s (bad JSON, oversize image, unknown route, WS-less 426 n/a) | `invalid_request_error` | `invalid_request_error` | 400/404 |
+| `session/setModel` rejected `commandRejected`/`invalid_model` | `invalid_request_error`/`unknown_model` | `response.failed code=invalid_request_error` | 400 |
 | Host dead + restart budget spent | `server_error` + `Retry-After: 5` | `response.failed code=server_error` + `Retry-After: 5` | 503 |
 
 SSE streams that fail mid-turn: emit the terminal failure event

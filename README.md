@@ -161,10 +161,15 @@ Notes:
   auto-approves.
 - **Slash commands:** the advertised list is live — protocol
   commands (`/help /status /usage /name /models /effort /recap
-  /compact /exit`) plus every skill `muse skills list` reports for
-  the workspace. `/<id>` maps to Muse's `/skill` grammar; protocol
-  commands settle locally and never start a turn. A leading space
-  escapes execution (` /plan` stays literal text).
+  /stop /goal /tasks /compact /exit`) plus every skill `muse skills
+  list` reports for the workspace. `/<id>` maps to Muse's `/skill`
+  grammar; protocol commands settle locally and never start a turn.
+  A leading space escapes execution (` /plan` stays literal text).
+- **Client MCP servers** (`session/new` `mcpServers`) forward into
+  session construction: stdio entries (`name` + `command`) and URL
+  entries ride `config.mcpServers`; entries with neither warn and
+  skip, never failing the session. Resume/load/fork re-attach an
+  existing session, so servers only attach at creation.
 - **Sessions:** each Zed session gets its own MSP session rooted at
   the folder you opened; closing the Zed session ends it. Session
   list, resume, and fork are all exposed to the client.

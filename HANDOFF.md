@@ -18,24 +18,27 @@ the next.
 3. [PRD.md](/home/josh/code/muse-client-bridge/PRD.md) — original goals (context only).
 4. `.cache/reference/README.md` — what's cached where.
 
-## Current state (refreshed 2026-09-16, TODO P7–P9 landed)
+## Current state (refreshed 2026-09-17, wire-real follow-ups landed)
 
 - **ACP parity:** dynamic skill slash commands (`muse skills list
   --json` per session workspace, `/<id>` → `/skill <id>`); protocol
   commands `/help` `/status` `/usage` `/name` `/models` `/exit`
-  `/effort` `/recap` settle inline (never `turn/start`); approvals
-  bridge via `session/request_permission`; user input via
-  `elicitation/create` (gated on the client's `elicitation.form`
-  capability). Per-session observers fold MSP events into facts +
-  ACP updates and resubscribe across host restarts. New surface:
-  `src/acp/skills.rs`, `ClientRequests` in `server.rs`, observer +
-  dialog state machines in `sessions.rs`.
+  `/effort` `/recap` `/stop` `/goal` `/tasks` settle inline (never
+  `turn/start`); approvals bridge via `session/request_permission`;
+  user input via `elicitation/create` (gated on the client's
+  `elicitation.form` capability). Per-session observers fold MSP
+  events into facts + ACP updates and resubscribe across host
+  restarts. `session/new` `mcpServers` forward into
+  `session/start`'s `config.mcpServers` (warn-and-skip per entry).
+  New surface: `src/acp/skills.rs`, `ClientRequests` in `server.rs`,
+  observer + dialog state machines in `sessions.rs`.
 - **Spike resolved:** the remaining "genuine gaps" are mostly
   TUI-only — `/side` `/new` `/clear` `/init` `/deep-research`
   `/memory` `/rules` `/mcp` `/export` have no MSP entry point
-  (findings in TODO.md). Wire-real follow-ups: client
-  `mcpServers` → `SessionConfig.mcpServers`, `/stop` →
-  `turn/cancel`, `/goal` display card.
+  (findings in TODO.md). The wire-real follow-ups all landed
+  (`mcpServers` forwarding, `/stop`, `/goal`, `/tasks`); the
+  status/recap goal line now reads `Goal.objective`. `/workflows`
+  `/subagents` deferred: no MSP list method, no ACP shape.
 - **Gates:** `cargo test` (214 tests), `clippy -D warnings`,
   `fmt --check`, `cargo build --release` all clean.
 

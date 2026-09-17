@@ -18,9 +18,9 @@ stay parallel-safe):
                   (key methods append assertion details; client responses to
                   server requests log as "<response> id=<id> result|error")
   FAKE_INPUT      file recording one {"method","params"} JSON object per line
-                  for turn/start, turn/steer, session/resume, session/fork,
-                  session/compact, session/setModel, session/setApprovalMode
-                  (assert what the bridge sent the host)
+                  for turn/start, turn/steer, session/start, session/resume,
+                  session/fork, session/compact, session/setModel,
+                  session/setApprovalMode (assert what the bridge sent the host)
   FAKE_LAUNCH_LOG file recording one line per process start (restart counting)
   FAKE_VERDICT    file the probe-unknown scenario writes OK/FAIL into
   FAKE_SCHEMA_VERSION / FAKE_FINGERPRINT / FAKE_DURABILITY ("absent" omits it)
@@ -31,6 +31,8 @@ stay parallel-safe):
                   without a turn) to the seeded history
   FAKE_HISTORY_TOOL "1" adds a completed toolCall item to the seeded history
   FAKE_GRANT_USERSHELL "1" grants the userShell capability at initialize
+  FAKE_WITHHOLD_SESSIONMCP "1" withholds the sessionMcp grant (default:
+                  granted — proves the bridge gates config.mcpServers)
   FAKE_CRASH_AFTER_TURN_START "1" exits(1) right after the next turn/start
                   ack (mid-turn host death); one-shot when FAKE_RESTART_MARKER
                   names a file (crash once, behave after the supervisor
@@ -43,6 +45,10 @@ stay parallel-safe):
   FAKE_NOISE      "1" prefixes turn-happy with rule-7 noise: an unparsable
                   line, an unknown notification, an unknown item kind, and an
                   unknown item-status enum (the turn must still complete)
+  FAKE_GOAL       "1" emits session/goalChanged after every session/read
+                  result (drives /goal and the status/recap goal line)
+  FAKE_TODOS      "1" emits session/todoListChanged after every session/read
+                  result (drives /tasks and plan updates)
 
 Reads stdin until EOF, then exits 0 (like the real host's orderly drain).
 """
@@ -65,12 +71,15 @@ FAKE_MODE = os.environ.get("FAKE_MODE", "denyUnmatched")
 FAKE_FAIL_REASON = os.environ.get("FAKE_FAIL_REASON", "")
 FAKE_HISTORY = os.environ.get("FAKE_HISTORY", "")
 GRANT_USERSHELL = os.environ.get("FAKE_GRANT_USERSHELL", "")
+WITHHOLD_SESSIONMCP = os.environ.get("FAKE_WITHHOLD_SESSIONMCP", "")
 FAKE_COMPACT = os.environ.get("FAKE_COMPACT", "accepted")
 FAKE_INPUT = os.environ.get("FAKE_INPUT", "")
 FAKE_CRASH_AFTER_TURN_START = os.environ.get("FAKE_CRASH_AFTER_TURN_START", "")
 FAKE_RESTART_MARKER = os.environ.get("FAKE_RESTART_MARKER", "")
 FAKE_HISTORY_FORK = os.environ.get("FAKE_HISTORY_FORK", "")
 FAKE_HISTORY_TOOL = os.environ.get("FAKE_HISTORY_TOOL", "")
+FAKE_GOAL = os.environ.get("FAKE_GOAL", "")
+FAKE_TODOS = os.environ.get("FAKE_TODOS", "")
 
 MSP_SID = "fake-sess-1"
 OVERLOADED_LEFT = {}
@@ -144,6 +153,9 @@ def log_method(method, params):
         detail = f" ui={params.get('userInputId', '-')} reason={params.get('reason', '-')}"
     elif method == "session/start":
         detail = f" mode={params.get('approvalMode', '-')} ws={params.get('workspaceRoot', '-')}"
+        mcp = (params.get("config") or {}).get("mcpServers") or {}
+        if mcp:
+            detail += f" mcp={','.join(sorted(mcp))}"
     elif method == "session/setModel":
         detail = f" model={(params.get('model') or {}).get('modelId', '-')}"
     elif method == "session/setApprovalMode":
@@ -178,8 +190,9 @@ def log_response(msg):
         f.write(f"<response> id={msg.get('id')} {kind}\n")
 
 
-INPUT_METHODS = ("turn/start", "turn/steer", "session/resume", "session/fork",
-                 "session/compact", "session/setModel", "session/setApprovalMode")
+INPUT_METHODS = ("turn/start", "turn/steer", "session/start", "session/resume",
+                 "session/fork", "session/compact", "session/setModel",
+                 "session/setApprovalMode")
 
 
 def log_input(method, params):
@@ -195,9 +208,12 @@ def send(obj):
 
 
 def initialize_result():
+    grants = [] if WITHHOLD_SESSIONMCP else ["sessionMcp"]
+    if GRANT_USERSHELL:
+        grants.append("userShell")
     result = {
         "experimentalApi": False,
-        "grantedCapabilities": ["userShell"] if GRANT_USERSHELL else [],
+        "grantedCapabilities": grants,
         "museHome": "/tmp/fake-muse-home",
         "platformFamily": "unix",
         "platformOs": "linux",
@@ -850,6 +866,23 @@ def main():
         body["jsonrpc"] = "2.0"
         body["id"] = req_id
         send(body)
+        if method == "session/read" and "result" in body:
+            # Read-triggered (not start-triggered): the bridge's per-session
+            # observer subscribes after session creation, so facts emitted
+            # here always land on a live subscription.
+            if FAKE_GOAL:
+                notify("session/goalChanged", {"goal": {
+                    "objective": "Ship the fake feature", "status": "active",
+                    "percentComplete": 40, "currentWork": "fake tests",
+                    "nextWork": "fake docs",
+                }})
+            if FAKE_TODOS:
+                notify("session/todoListChanged", {"items": [
+                    {"text": "fake done", "status": "completed"},
+                    {"text": "Write fake tests", "status": "inProgress",
+                     "activeForm": "Writing fake tests"},
+                    {"text": "fake todo", "status": "pending"},
+                ], "revision": 1, "sourceTool": "fake"})
         if (FAKE_CRASH_AFTER_TURN_START and method == "turn/start"
                 and "result" in body):
             sys.stdout.flush()

@@ -498,8 +498,48 @@ async fn acp_handshake_requests_usershell_capability() {
     let client = AcpClient::connect(env).await;
     let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        log_text.contains("initialize cmd=- caps=userShell"),
-        "initialize requests userShell: {log_text}"
+        log_text.contains("initialize cmd=- caps=userShell,sessionMcp"),
+        "initialize requests userShell + sessionMcp: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_session_new_drops_mcp_servers_without_the_grant() {
+    // Ungranted hosts reject config.mcpServers at construction
+    // (capabilityRequired, verified live): the bridge drops the servers
+    // loudly and the session still succeeds.
+    let input = unique_dir("mcpdrop").join("fake.input");
+    let cwd = unique_dir("mcpdropcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_INPUT", input.to_string_lossy().into_owned());
+    env.insert("FAKE_WITHHOLD_SESSIONMCP", "1".to_string());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy(),
+                "mcpServers": [{"name": "x", "command": "y"}]}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    assert!(
+        frames.last().unwrap().get("result").is_some(),
+        "the session survives the dropped servers: {frames:?}"
+    );
+    let lines = read_input_lines(&input);
+    let started: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["method"] == json!("session/start"))
+        .collect();
+    assert_eq!(started.len(), 1, "one session/start: {lines:?}");
+    assert!(
+        started[0]["params"].get("config").is_none(),
+        "no config without the grant: {}",
+        started[0]
     );
     client.shutdown().await;
 }
@@ -2794,6 +2834,249 @@ async fn acp_user_input_decline_cancels_fail_closed() {
     assert!(
         log_text.contains("userInput/cancel"),
         "a declined form cancels the prompt: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_session_new_forwards_mcp_servers() {
+    let input = unique_dir("mcpnew").join("fake.input");
+    let log = unique_dir("mcpnew").join("fake.log");
+    let cwd = unique_dir("mcpnewcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_INPUT", input.to_string_lossy().into_owned());
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+        "params": {"cwd": cwd.to_string_lossy(), "mcpServers": [
+            {"name": "files", "command": "mcp-files", "args": ["--root"],
+             "env": [{"name": "HOME", "value": "/r"}]},
+            {"name": "web", "url": "https://mcp.example/s",
+             "headers": {"Authorization": "Bearer t"}},
+            {"name": "broken"},
+        ]}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    assert!(
+        frames.last().unwrap().get("result").is_some(),
+        "unmappable entries never brick the session: {frames:?}"
+    );
+    let lines = read_input_lines(&input);
+    let started: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["method"] == json!("session/start"))
+        .collect();
+    assert_eq!(started.len(), 1, "one session/start: {lines:?}");
+    assert_eq!(
+        started[0]["params"]["config"],
+        json!({"mcpServers": {
+            "files": {"transport": "stdio", "command": "mcp-files",
+                      "args": ["--root"], "env": {"HOME": "/r"}},
+            "web": {"transport": "streamableHttp", "url": "https://mcp.example/s",
+                    "headers": {"Authorization": "Bearer t"}},
+        }}),
+        "config.mcpServers forwarded: {}",
+        started[0]
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        log_text.contains("mcp=files,web"),
+        "start line names the forwarded servers: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_stop_cancels_the_in_flight_turn() {
+    let log = unique_dir("stopcmd").join("fake.log");
+    let cwd = unique_dir("stopcmdcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "turn-tool-slow".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["slow work"]}}),
+        )
+        .await;
+    poll_log_contains(&log, "turn/start cmd=", Duration::from_secs(10)).await;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 4, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/stop"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(4))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"}),
+        "/stop settles inline: {frames:?}"
+    );
+    let card: String = frames
+        .iter()
+        .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert!(card.contains("Stopped 1 turn"), "/stop card: {card}");
+    // The slow prompt settles cancelled, exactly like session/cancel.
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "cancelled"})
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    let start = log_text
+        .lines()
+        .find(|l| l.starts_with("turn/start cmd="))
+        .expect("turn/start logged");
+    let cmd = start
+        .split_whitespace()
+        .find(|t| t.starts_with("cmd="))
+        .expect("commandId logged");
+    let turn = cmd.trim_start_matches("cmd=");
+    assert!(
+        log_text.contains("turn/cancel cmd=") && log_text.contains(&format!("turn={turn}")),
+        "/stop cancels the EXPLICIT in-flight turn: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_stop_idle_reports_nothing_to_stop() {
+    let log = unique_dir("stopidle").join("fake.log");
+    let cwd = unique_dir("stopidlecwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_LOG", log.to_string_lossy().into_owned());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/stop"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"}),
+        "/stop settles inline: {frames:?}"
+    );
+    let card: String = frames
+        .iter()
+        .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+        .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+        .collect();
+    assert!(
+        card.contains("No in-flight turn to stop"),
+        "/stop idle card: {card}"
+    );
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !log_text.contains("turn/cancel"),
+        "idle /stop sends no cancel: {log_text}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_goal_and_tasks_cards_render_folded_facts() {
+    let cwd = unique_dir("goalcwd");
+    let mut env = HashMap::from([("FAKE_SCENARIO", "serve".to_string())]);
+    env.insert("FAKE_GOAL", "1".to_string());
+    env.insert("FAKE_TODOS", "1".to_string());
+    let mut client = AcpClient::connect(env).await;
+    let acp_sid = v1_session(&mut client, &cwd).await;
+
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    // /status triggers session/read; the fake emits goalChanged +
+    // todoListChanged after the result, which the observer folds.
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/status"]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    // The fold lands asynchronously; poll the pure-fold cards.
+    let mut next_id = 4;
+    let mut poll_card = async |slash: &str, want: &str| -> String {
+        let mut card = String::new();
+        for _ in 0..50 {
+            client
+                .send(
+                    &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+                    "params": {"sessionId": acp_sid, "prompt": [slash]}}),
+                )
+                .await;
+            let frames = client
+                .recv_until(|f| f.get("id") == Some(&json!(next_id)))
+                .await;
+            next_id += 1;
+            assert_eq!(
+                frames.last().unwrap()["result"],
+                json!({"stopReason": "end_turn"}),
+                "{slash} settles inline"
+            );
+            card = card_of(&frames);
+            if card.contains(want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        card
+    };
+    let goal = poll_card("/goal", "Ship the fake feature").await;
+    for want in [
+        "**Goal**",
+        "- Objective: Ship the fake feature",
+        "- Status: active · 40%",
+        "- Current: fake tests",
+        "- Next: fake docs",
+    ] {
+        assert!(goal.contains(want), "/goal card has {want}: {goal}");
+    }
+    let tasks = poll_card("/tasks", "Writing fake tests").await;
+    for want in [
+        "**Tasks**",
+        "- [x] fake done",
+        "- [~] Writing fake tests",
+        "- [ ] fake todo",
+    ] {
+        assert!(tasks.contains(want), "/tasks card has {want}: {tasks}");
+    }
+    // A second /status now carries the goal line (objective, not echo).
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/status"]}}),
+        )
+        .await;
+    let frames = client
+        .recv_until(|f| f.get("id") == Some(&json!(next_id)))
+        .await;
+    let status = card_of(&frames);
+    assert!(
+        status.contains("- Goal: Ship the fake feature"),
+        "status goal line: {status}"
     );
     client.shutdown().await;
 }

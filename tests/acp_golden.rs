@@ -560,6 +560,18 @@ const GOLDEN_SESSION_NEW_V1: &str = r#"[
             "name": "recap"
           },
           {
+            "description": "Stop the in-flight turn",
+            "name": "stop"
+          },
+          {
+            "description": "Show the session goal",
+            "name": "goal"
+          },
+          {
+            "description": "Show the session task list",
+            "name": "tasks"
+          },
+          {
             "description": "Close this session",
             "name": "exit"
           },
@@ -774,6 +786,18 @@ const GOLDEN_SESSION_NEW_V2: &str = r#"[
           {
             "description": "Show a recap of recent session activity",
             "name": "recap"
+          },
+          {
+            "description": "Stop the in-flight turn",
+            "name": "stop"
+          },
+          {
+            "description": "Show the session goal",
+            "name": "goal"
+          },
+          {
+            "description": "Show the session task list",
+            "name": "tasks"
           },
           {
             "description": "Close this session",
