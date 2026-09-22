@@ -118,16 +118,52 @@ impl ChildHandle {
     }
 }
 
+/// Args the host child receives: subcommand, then `MUSE_SERVE_ARGS`.
+fn host_args(spec: &ChildSpec) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(subcommand) = &spec.subcommand {
+        args.push(subcommand.clone());
+    }
+    args.extend(spec.args.iter().cloned());
+    args
+}
+
+/// Launch `bin` plus `args`. On Windows a `muse.cmd` shim goes through
+/// `cmd.exe`, because `Command::new("muse")` only finds `muse.exe`.
+pub fn command_for_host(bin: &str, args: &[String]) -> Command {
+    #[cfg(windows)]
+    {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        match crate::msp::host_bin::resolve_host_bin(bin, &path, &pathext) {
+            crate::msp::host_bin::ResolvedHost::Script(script) => {
+                let mut cmd = Command::new("cmd.exe");
+                cmd.arg("/d").arg("/s").arg("/c");
+                cmd.raw_arg(crate::msp::host_bin::cmd_c_payload(&script, args));
+                cmd
+            }
+            crate::msp::host_bin::ResolvedHost::Direct(program) => {
+                let mut cmd = Command::new(program);
+                cmd.args(args);
+                cmd
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new(bin);
+        cmd.args(args);
+        cmd
+    }
+}
+
 /// Spawn the host child with piped stdio and a stderr capture task.
 ///
 /// Env is inherited (so `muse login` credentials apply); stdio errors become
 /// actionable [`describe_spawn_error`] text.
 pub fn spawn_child(spec: &ChildSpec) -> Result<SpawnedChild, String> {
-    let mut cmd = Command::new(&spec.bin);
-    if let Some(subcommand) = &spec.subcommand {
-        cmd.arg(subcommand);
-    }
-    cmd.args(&spec.args);
+    let mut cmd = command_for_host(&spec.bin, &host_args(spec));
     cmd.current_dir(&spec.cwd);
     cmd.envs(spec.extra_env.iter().cloned());
     cmd.stdin(Stdio::piped())

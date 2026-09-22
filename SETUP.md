@@ -58,7 +58,7 @@ The Windows release files are already named `muse-acp-bridge.exe` and `muse-brid
 
 ```powershell
 $dir = "$env:LOCALAPPDATA\Programs\muse"
-Invoke-WebRequest https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.1/muse-acp-bridge.exe -OutFile "$dir\muse-acp-bridge.exe"
+Invoke-WebRequest https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.2/muse-acp-bridge.exe -OutFile "$dir\muse-acp-bridge.exe"
 ```
 
 The one prerequisite that matters is not the bridge: you need the
@@ -184,7 +184,7 @@ Desktop after writing.
 | `--selftest` FAIL + login hint, or HTTP `401` | Run `muse login` as the bridge user, retry. |
 | `failed to bind 127.0.0.1:17489` | Something owns the port (historical note: pre-release default `18789` collided with OpenClaw). Pass `--port` / `MUSE_BRIDGE_PORT`. |
 | Codex warns `Model metadata ... not found` | Point `model_catalog_json` at the example catalog. |
-| `muse: command not found` | Put `muse` on `PATH` or set `MUSE_CLI=/path/to/muse`. |
+| `muse: command not found` | Put `muse` on `PATH` or set `MUSE_CLI=/path/to/muse`. On Windows that file is `muse.cmd`. v0.1.2 and later launch it. |
 
 `muse-bridge --support` prints a JSON bundle (versions, fingerprint
 pin vs live, stderr tail) for bug reports.

@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
-use tokio::process::Command;
 
 use crate::msp::host::HostConfig;
 
@@ -52,16 +51,19 @@ pub async fn list_skills(config: &HostConfig, workspace: &str) -> Vec<SkillEntry
 
 /// Spawn + read + parse. `Err` carries a short human reason for the log.
 async fn run_skills_list(config: &HostConfig, workspace: &str) -> Result<Vec<SkillEntry>, String> {
-    let mut cmd = Command::new(&config.bin);
-    cmd.args(["skills", "list", "--json"]);
-    // Mirror the serve posture: workspace trust is what exposes
-    // project/user skills to the session anyway.
+    let mut argv = vec![
+        "skills".to_string(),
+        "list".to_string(),
+        "--json".to_string(),
+    ];
     if config.serve_args.iter().any(|a| a == "--trust-workspace") {
-        cmd.arg("--trust-workspace");
+        argv.push("--trust-workspace".to_string());
     }
     if !workspace.is_empty() {
-        cmd.args(["--workspace", workspace]);
+        argv.push("--workspace".to_string());
+        argv.push(workspace.to_string());
     }
+    let mut cmd = crate::msp::spawn::command_for_host(&config.bin, &argv);
     for (key, value) in &config.extra_env {
         cmd.env(key, value);
     }

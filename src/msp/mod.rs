@@ -5,5 +5,6 @@
 
 pub mod fold;
 pub mod host;
+pub mod host_bin;
 pub mod proto;
 pub mod spawn;
