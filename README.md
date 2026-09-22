@@ -12,9 +12,15 @@ and serves it two ways:
 - No API keys handled, none stored. Auth comes from your existing
   `muse login`, inherited by `muse serve`.
 
-> Status: HTTP surface through P6 (MSP client, diagnostics,
-> examples) plus an ACP surface for Zed/JetBrains (FORK_PLAN P1–P6).
-> P7 live-host and client-compat gates are still pending.
+> Status: complete — HTTP surface (P0–P7: chat, responses,
+> models, diagnostics, examples; live-host E2E green) plus the ACP
+> surface for Zed/JetBrains (FORK_PLAN P1–P6 and parity P7–P9:
+> slash commands, skills, subagent/workflow display + control,
+> permission/user-input dialogs, MCP forwarding). Automated gates
+> green (314 tests, clippy, fmt — verified 2026-09-20; live-host
+> suite green 2026-09-17, needs `muse login`).
+> Remaining: manual client-compat runs (Hermes, Codex, Desktop,
+> Zed, JetBrains) — release gates recorded in release notes.
 > See [SPEC.md](/home/josh/code/muse-client-bridge/SPEC.md) for the normative build spec and [PRD.md](/home/josh/code/muse-client-bridge/PRD.md) for goals.
 
 ## Install
@@ -180,6 +186,10 @@ Notes:
   `/<id>` maps to Muse's `/skill`
   grammar; protocol commands settle locally and never start a turn.
   A leading space escapes execution (` /plan` stays literal text).
+  CLI-only commands with no MSP entry point (`/deep-research`,
+  `/side`, `/memory`, `/rules`, `/mcp`, `/export`, `/init`, …)
+  are not intercepted — they reach the model as literal prompt
+  text (per-command verdicts in TODO.md).
 - **Client MCP servers** (`session/new` `mcpServers`) forward into
   session construction: stdio entries (`name` + `command`) and URL
   entries ride `config.mcpServers`; entries with neither warn and
@@ -243,6 +253,11 @@ the right one per workspace.
 
 Unknown JSON fields are ignored on every endpoint; `Authorization` is
 accepted in any form and never inspected.
+
+Any other OpenAI-compatible client (ZCode, etc.) works the same
+way: point its base URL at `http://127.0.0.1:17489/v1` — chat-style
+clients use `/v1/chat/completions`, Responses-style clients use
+`/v1/responses`, and `/v1/models` serves discovery.
 
 ## Behavior notes
 

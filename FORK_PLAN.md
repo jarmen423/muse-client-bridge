@@ -4,6 +4,11 @@
 > TODO P9 — approvals now bridge to `session/request_permission` and user
 > input to `elicitation/create` (fail closed only when the client lacks the
 > surface). See TODO.md for the landed parity list.
+>
+> **Status (2026-09-20):** P1–P6 plus parity P7–P9 complete — every
+> MSP-bridgeable command, skill, dialog, and control verb is landed
+> (TODO.md spike); the remainder has no MSP entry point and stays
+> prompt text by design. Open: manual Zed/JetBrains client-compat runs.
 
 ## Goal
 

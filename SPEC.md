@@ -1,6 +1,6 @@
 # Muse Bridge — Specification
 
-**Status:** draft for review · **Date:** 2026-09-14 · **Source of truth:** [PRD.md](/home/josh/code/muse-client-bridge/PRD.md)
+**Status:** implemented (HTTP P0–P7 + ACP surface per FORK_PLAN P1–P6 and parity P7–P9) · **Date:** 2026-09-20 · **Source of truth:** [PRD.md](/home/josh/code/muse-client-bridge/PRD.md)
 
 Muse Bridge is a single Rust binary that runs on localhost, exposes an
 OpenAI-compatible HTTP API, and translates each request into the Muse Session
@@ -37,6 +37,8 @@ Non-goals (v1):
   execute its own host tools opaquely. A real tool-call bridge
   (MSP approvals → client `tool_calls`) is a v2 design item (§8).
 - N3. No Zed ACP surface in v1 (defer to v2; `muse-acp` proves the shape).
+  SUPERSEDED 2026-09-16: built as `muse-acp-bridge` per FORK_PLAN.md
+  (FORK_PLAN P1–P6 + parity P7–P9); see README "Use it from Zed".
 - N4. No auth, no TLS, no credentials storage. Binds loopback only.
 - N5. No sticky cross-request sessions in v1: one MSP session per HTTP
   request (clients resend full history; MSP owns nothing across
@@ -468,8 +470,10 @@ with an `{"error":…}` data frame. The bridge does that for chat, and
 - V2.3 Human-in-the-loop endpoint for approvals/user-input
   (`GET /v1/pending`, `POST /v1/decide`).
 - V2.4 Zed ACP surface (sidecar binary reusing the MSP client crate;
-  see muse-acp).
-- V2.5 T3Code via ACP (same vehicle as V2.4).
+  see muse-acp). DONE: `muse-acp-bridge` (FORK_PLAN P1–P6 +
+  parity P7–P9); manual Zed/JetBrains runs still pending.
+- V2.5 T3Code via ACP (same vehicle as V2.4). Vehicle exists;
+  no T3Code client-compat run yet.
 - V2.6 `item/readOutput` fetch for `truncated: true` surfaces;
   image-output passthrough.
 

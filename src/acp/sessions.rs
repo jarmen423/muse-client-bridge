@@ -1039,14 +1039,14 @@ impl SessionStore {
         // state (notably a result that landed while choosing).
         let record = {
             let inner = self.inner.lock().await;
-            match inner
+            inner
                 .sessions
                 .get(acp_sid)
                 .and_then(|s| s.children.get(&item_id))
-            {
-                Some(record) => record.clone(),
-                None => return Ok(self.subagents_card(acp_sid).await),
-            }
+                .cloned()
+        };
+        let Some(record) = record else {
+            return Ok(self.subagents_card(acp_sid).await);
         };
         // `result` renders retained truth; consume (`readResult` is
         // state-changing) only when nothing is kept.

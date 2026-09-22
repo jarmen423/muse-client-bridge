@@ -1,5 +1,10 @@
 # HANDOFF — Build Muse Bridge (next session)
 
+> **Build complete (2026-09-20):** P0–P7 + ACP P1–P9 all landed; 314
+> tests + clippy + fmt green (verified 2026-09-20), live-host suite
+> green 2026-09-17. The packet plan below is historical — see
+> README.md status for what remains (manual client-compat gates).
+
 ## Mission
 
 Implement the Rust binary specified in [SPEC.md](/home/josh/code/muse-client-bridge/SPEC.md):

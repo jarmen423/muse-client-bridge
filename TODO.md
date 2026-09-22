@@ -19,7 +19,7 @@
   │ Images          │ attach         │ yes              │
   └─────────────────┴────────────────┴──────────────────┘
 
-  Queued in approved P7–P9
+  Landed in P7–P9
 
   ┌────────────────────┬───────────────────┬───────────────────┐
   │ Area               │ CLI               │ Bridge            │
@@ -32,7 +32,8 @@
   │ User questions     │ ask UI            │ P9, port upstream │
   └────────────────────┴───────────────────┴───────────────────┘
 
-  Genuine gaps (need research or design)
+  Genuine gaps (all resolved by the spike below: MSP-bridgeable
+  items landed; the rest have no wire method and stay prompt text)
 
   • /side, /memory, /rules, /mcp — host mapping unknown; needs a spike before committing.
   • /init, /deep-research — agentic flows; could be sent as directed turns, needs design.

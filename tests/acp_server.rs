@@ -3524,6 +3524,144 @@ async fn acp_subagent_verbs_offer_pickers() {
 }
 
 #[tokio::test]
+async fn acp_subagents_close_during_picker_settles_without_deadlock() {
+    // A1 regression: `session/close` racing a `/subagents` picker used to
+    // self-deadlock (the fallback `subagents_card().await` ran under the
+    // held store guard), parking the handler AND the global lock.
+    // Close-then-answer must settle promptly and leave the store usable.
+    let cwd = unique_dir("closepickcwd");
+    let mut client = AcpClient::connect(HashMap::from([(
+        "FAKE_SCENARIO",
+        "turn-children".to_string(),
+    )]))
+    .await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}}}}))
+        .await;
+    let _ = client.recv().await;
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}))
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(2))).await;
+    let acp_sid = frames.last().unwrap()["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    drain_advertisement(&mut client).await;
+    let card_of = |frames: &[Value]| -> String {
+        frames
+            .iter()
+            .filter(|f| f["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect()
+    };
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": [{"type": "text", "text": "go"}]}}),
+        )
+        .await;
+    let frames = client.recv_until(|f| f.get("id") == Some(&json!(3))).await;
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"})
+    );
+    // Wait for retention (bare cards never elicit).
+    let mut next_id = 4;
+    for _ in 0..50 {
+        client
+            .send(
+                &json!({"jsonrpc": "2.0", "id": next_id, "method": "session/prompt",
+                "params": {"sessionId": acp_sid, "prompt": ["/subagents"]}}),
+            )
+            .await;
+        let frames = client
+            .recv_until(|f| f.get("id") == Some(&json!(next_id)))
+            .await;
+        next_id += 1;
+        if card_of(&frames).contains("Write the migration") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Park a target-less verb on its picker, then close underneath it.
+    let prompt_id = next_id;
+    next_id += 1;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt",
+            "params": {"sessionId": acp_sid, "prompt": ["/subagents stop"]}}),
+        )
+        .await;
+    let elic_id = loop {
+        let frame = client.recv().await;
+        if frame["method"].as_str() == Some("elicitation/create") {
+            break frame["id"].clone();
+        }
+    };
+    let close_id = next_id;
+    next_id += 1;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": close_id, "method": "session/close",
+            "params": {"sessionId": acp_sid}}),
+        )
+        .await;
+    let frames = client
+        .recv_until(|f| f.get("id") == Some(&json!(close_id)))
+        .await;
+    assert!(
+        frames.last().unwrap().get("result").is_some(),
+        "close lands while the picker is parked: {frames:?}"
+    );
+    client
+        .send(&json!({"jsonrpc": "2.0", "id": elic_id,
+            "result": {"action": "accept",
+                "content": {"choice": "[x] Explore the schema (child-1)"}}}))
+        .await;
+    // The verb must settle (fallback card for the gone session), not park
+    // forever holding the store lock.
+    let frames = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.recv_until(|f| f.get("id") == Some(&json!(prompt_id))),
+    )
+    .await
+    .expect("verb settles after close-during-picker (self-deadlock?)");
+    assert_eq!(
+        frames.last().unwrap()["result"],
+        json!({"stopReason": "end_turn"}),
+        "verb settles inline: {frames:?}"
+    );
+    let card = card_of(&frames);
+    assert!(
+        card.contains("Subagents unavailable"),
+        "gone session falls back to the card: {card}"
+    );
+    // The store lock is free: a fresh session still opens.
+    let new_id = next_id;
+    client
+        .send(
+            &json!({"jsonrpc": "2.0", "id": new_id, "method": "session/new",
+            "params": {"cwd": cwd.to_string_lossy()}}),
+        )
+        .await;
+    let frames = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.recv_until(|f| f.get("id") == Some(&json!(new_id))),
+    )
+    .await
+    .expect("session/new still answers (global lock free?)");
+    assert!(
+        frames.last().unwrap()["result"]["sessionId"].is_string(),
+        "fresh session opens: {frames:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn acp_set_mode_switches_approval_posture() {
     // `session/set_mode` drives the switch and fails closed on unknown
     // modes/sessions (clients revert optimistic updates on error).
