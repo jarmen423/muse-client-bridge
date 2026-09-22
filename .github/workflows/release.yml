@@ -73,8 +73,13 @@ jobs:
               acp_src="$rel/muse-acp-bridge"
               ;;
           esac
-          cp "$http_src" "$rel/${{ matrix.http_asset }}"
-          cp "$acp_src" "$rel/${{ matrix.acp_asset }}"
+          copy_if_needed() {
+            if [ "$1" != "$2" ]; then
+              cp "$1" "$2"
+            fi
+          }
+          copy_if_needed "$http_src" "$rel/${{ matrix.http_asset }}"
+          copy_if_needed "$acp_src" "$rel/${{ matrix.acp_asset }}"
           "$rel/${{ matrix.http_asset }}" --help >/dev/null
           MUSE_CLI=definitely-not-a-real-binary \
             "$rel/${{ matrix.http_asset }}" --support 2>/dev/null | grep -q '"reachable": false'
