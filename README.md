@@ -51,7 +51,7 @@ curl http://127.0.0.1:17489/healthz
 
 ## Point T3 Code at it
 
-T3 Code spawns `muse-acp-bridge`. It does not spawn `muse-bridge` or `muse`. Put `muse-acp-bridge` on the T3 server's PATH, or set **Settings → Providers → Binary path** to that file. On Windows, copy `muse-acp-bridge-windows-x86_64.exe` from the release to `%LOCALAPPDATA%\Programs\muse\muse-acp-bridge.exe` after `muse login`. See [SETUP.md](SETUP.md).
+T3 Code spawns `muse-acp-bridge`. It does not spawn `muse-bridge` or `muse`. Put `muse-acp-bridge` on the T3 server's PATH, or set **Settings → Providers → Binary path** to that file. On Windows the release file is already `muse-acp-bridge.exe`. Save it to `%LOCALAPPDATA%\Programs\muse\muse-acp-bridge.exe`. See [SETUP.md](SETUP.md).
 
 ## Point Hermes at it
 

@@ -54,19 +54,11 @@ irm https://dev.meta.ai/install.ps1 | iex
 
 The installer writes `muse.cmd` under `%LOCALAPPDATA%\Programs\muse` and adds that directory to your user PATH. Open a new terminal and run `muse login`.
 
-Copy the release exe your client actually launches into that same directory. T3 Code, Zed, and JetBrains need `muse-acp-bridge.exe`. Hermes and Codex need `muse-bridge.exe`. Renaming one file to the other name does not change which protocol it speaks.
+The Windows release files are already named `muse-acp-bridge.exe` and `muse-bridge.exe`. Download the one your client launches into that same directory. Do not rename it. T3 Code, Zed, and JetBrains need `muse-acp-bridge.exe`. Hermes and Codex need `muse-bridge.exe`.
 
 ```powershell
-$tag = "v0.1.1"
-$asset = "muse-acp-bridge-windows-x86_64.exe"   # HTTP clients: muse-bridge-windows-x86_64.exe
-$name = "muse-acp-bridge.exe"                   # HTTP clients: muse-bridge.exe
-$base = "https://github.com/jarmen423/muse-client-bridge/releases/download/$tag"
-Invoke-WebRequest "$base/$asset" -OutFile $asset
-Invoke-WebRequest "$base/$asset.sha256" -OutFile "$asset.sha256"
-$expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLower()
-$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
-if ($actual -ne $expected) { throw "checksum mismatch for $asset" }
-Copy-Item $asset "$env:LOCALAPPDATA\Programs\muse\$name"
+$dir = "$env:LOCALAPPDATA\Programs\muse"
+Invoke-WebRequest https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.1/muse-acp-bridge.exe -OutFile "$dir\muse-acp-bridge.exe"
 ```
 
 The one prerequisite that matters is not the bridge: you need the

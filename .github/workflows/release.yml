@@ -9,7 +9,8 @@
 # - muse-acp-bridge: ACP over stdio, for T3 Code, Zed, and JetBrains
 #
 # Muse Code ships a native Windows CLI (https://dev.meta.ai/install.ps1).
-# The Windows binaries drive that CLI. See SETUP.md.
+# Windows assets use the command name (muse-acp-bridge.exe), not a
+# platform suffix. T3 looks up that name on PATH.
 name: release
 
 on:
@@ -42,8 +43,8 @@ jobs:
             acp_asset: muse-acp-bridge-linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            http_asset: muse-bridge-windows-x86_64.exe
-            acp_asset: muse-acp-bridge-windows-x86_64.exe
+            http_asset: muse-bridge.exe
+            acp_asset: muse-acp-bridge.exe
           - os: macos-latest
             target: aarch64-apple-darwin
             http_asset: muse-bridge-macos-aarch64
