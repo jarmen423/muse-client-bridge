@@ -7,8 +7,8 @@ and serves it two ways:
 - **`muse-bridge`** (localhost HTTP, OpenAI-compatible):
   **Hermes Agent (Desktop App)** sends `POST /v1/chat/completions`,
   **Codex CLI / IDE / ChatGPT Desktop** send `POST /v1/responses`.
-- **`muse-acp-bridge`** (ACP over stdio): spawned by **Zed** and
-  **JetBrains IDEs** as a custom agent server — no ports involved.
+- **`muse-acp-bridge`** (ACP over stdio): spawned by **T3 Code**, **Zed**, and
+  **JetBrains IDEs** as a custom agent server. No ports involved.
 - No API keys handled, none stored. Auth comes from your existing
   `muse login`, inherited by `muse serve`.
 
@@ -29,6 +29,8 @@ and serves it two ways:
 cargo build --release       # ./target/release/muse-bridge + ./target/release/muse-acp-bridge
 ```
 
+A GitHub release publishes both binaries. `muse-bridge` is the HTTP server. `muse-acp-bridge` is the stdio adapter T3 Code, Zed, and JetBrains spawn. See [SETUP.md](SETUP.md).
+
 Requires a `muse` binary on `PATH` at runtime (`muse login` first).
 
 ## Run
@@ -46,6 +48,10 @@ Quick checks:
 curl http://127.0.0.1:17489/v1/models
 curl http://127.0.0.1:17489/healthz
 ```
+
+## Point T3 Code at it
+
+T3 Code spawns `muse-acp-bridge`. It does not spawn `muse-bridge` or `muse`. Put `muse-acp-bridge` on the T3 server's PATH, or set **Settings → Providers → Binary path** to that file. On Windows, copy `muse-acp-bridge-windows-x86_64.exe` from the release to `%LOCALAPPDATA%\Programs\muse\muse-acp-bridge.exe` after `muse login`. See [SETUP.md](SETUP.md).
 
 ## Point Hermes at it
 

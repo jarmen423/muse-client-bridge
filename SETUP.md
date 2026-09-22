@@ -15,32 +15,59 @@ at it. For the full endpoint reference see
 
 ```sh
 cargo build --release
-# binary: ./target/release/muse-bridge
+# ./target/release/muse-bridge and ./target/release/muse-acp-bridge
 ```
 
-Or skip the toolchain and install from a release (replace `v0.1.0`
+Or skip the toolchain and install from a release (replace `v0.1.1`
 with the latest tag on the
-[releases page](https://github.com/jarmen423/muse-client-bridge/releases)):
+[releases page](https://github.com/jarmen423/muse-client-bridge/releases)).
+Each release has two binaries. `muse-bridge` is the HTTP server.
+`muse-acp-bridge` is what T3 Code, Zed, and JetBrains spawn.
 
 ```sh
-# Linux (x86_64) — inside WSL2 if you are on Windows
-curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.0/muse-bridge-linux-x86_64
-curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.0/muse-bridge-linux-x86_64.sha256
+# Linux (x86_64), HTTP bridge
+curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.1/muse-bridge-linux-x86_64
+curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.1/muse-bridge-linux-x86_64.sha256
 sha256sum -c muse-bridge-linux-x86_64.sha256
 chmod +x muse-bridge-linux-x86_64
 mv muse-bridge-linux-x86_64 ~/.local/bin/muse-bridge   # or anywhere on PATH
+
+# Linux (x86_64), ACP bridge for T3 Code / Zed / JetBrains
+curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.1/muse-acp-bridge-linux-x86_64
+curl -LO https://github.com/jarmen423/muse-client-bridge/releases/download/v0.1.1/muse-acp-bridge-linux-x86_64.sha256
+sha256sum -c muse-acp-bridge-linux-x86_64.sha256
+chmod +x muse-acp-bridge-linux-x86_64
+mv muse-acp-bridge-linux-x86_64 ~/.local/bin/muse-acp-bridge
 ```
 
-macOS (Apple Silicon) is the same shape with the
-`muse-bridge-macos-aarch64` asset. The binary is unsigned, so on
-first run macOS may refuse it: right-click it in Finder, choose
-Open, and confirm — or run
-`xattr -d com.apple.quarantine ~/.local/bin/muse-bridge`.
+macOS (Apple Silicon) is the same shape with
+`muse-bridge-macos-aarch64` and `muse-acp-bridge-macos-aarch64`. The binaries are unsigned, so on
+first run macOS may refuse one: right-click it in Finder, choose
+Open, and confirm, or run
+`xattr -d com.apple.quarantine ~/.local/bin/muse-acp-bridge`.
 
-Windows users should run the Linux binary inside WSL2 (Meta ships
-no native Windows `muse` CLI, so a native bridge binary would have
-nothing to drive). Clients on the Windows side still point at
-`http://127.0.0.1:17489/v1`; WSL2 forwards localhost.
+On Windows, install Meta's native Muse CLI first. WSL is not required.
+
+```powershell
+irm https://dev.meta.ai/install.ps1 | iex
+```
+
+The installer writes `muse.cmd` under `%LOCALAPPDATA%\Programs\muse` and adds that directory to your user PATH. Open a new terminal and run `muse login`.
+
+Copy the release exe your client actually launches into that same directory. T3 Code, Zed, and JetBrains need `muse-acp-bridge.exe`. Hermes and Codex need `muse-bridge.exe`. Renaming one file to the other name does not change which protocol it speaks.
+
+```powershell
+$tag = "v0.1.1"
+$asset = "muse-acp-bridge-windows-x86_64.exe"   # HTTP clients: muse-bridge-windows-x86_64.exe
+$name = "muse-acp-bridge.exe"                   # HTTP clients: muse-bridge.exe
+$base = "https://github.com/jarmen423/muse-client-bridge/releases/download/$tag"
+Invoke-WebRequest "$base/$asset" -OutFile $asset
+Invoke-WebRequest "$base/$asset.sha256" -OutFile "$asset.sha256"
+$expected = ((Get-Content "$asset.sha256" -Raw) -split '\s+')[0].ToLower()
+$actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+if ($actual -ne $expected) { throw "checksum mismatch for $asset" }
+Copy-Item $asset "$env:LOCALAPPDATA\Programs\muse\$name"
+```
 
 The one prerequisite that matters is not the bridge: you need the
 `muse` CLI installed with `muse login` completed in the same
@@ -172,11 +199,10 @@ pin vs live, stderr tail) for bug reports.
 
 ## Cutting a release
 
-Push a tag; CI builds Linux, Windows, and macOS binaries, smoke
-tests each, and attaches them to the release:
+Push a tag. CI builds Linux, Windows, and macOS copies of both binaries, smoke-tests each, and attaches them to the release:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
 Re-running a failed release is safe (assets upload with `--clobber`).

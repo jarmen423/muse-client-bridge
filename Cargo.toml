@@ -1,6 +1,6 @@
 [package]
 name = "muse-bridge"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Localhost OpenAI-compatible HTTP API driving `muse serve` over MSP/stdio"

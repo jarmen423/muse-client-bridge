@@ -1,14 +1,15 @@
 # Release: tag `v*` -> compiled binaries attached to the GitHub Release.
 #
 # Flow: create the release (idempotent) -> matrix build per OS ->
-# smoke each binary WITHOUT `muse` present (`--support` must exit 0
-# with reachable:false) -> upload with --clobber so re-running a
-# failed release repairs it instead of duplicating assets.
+# smoke each binary WITHOUT `muse` present -> upload with --clobber so
+# re-running a failed release repairs it instead of duplicating assets.
 #
-# Platform honesty: the Windows asset compiles and serves HTTP, but
-# Meta ships no native Windows `muse` CLI (Windows users run the
-# Linux binary under WSL2). macOS is included because `muse`
-# supports it. See SETUP.md.
+# Each OS job builds both programs from this crate:
+# - muse-bridge: HTTP, for Hermes and Codex
+# - muse-acp-bridge: ACP over stdio, for T3 Code, Zed, and JetBrains
+#
+# Muse Code ships a native Windows CLI (https://dev.meta.ai/install.ps1).
+# The Windows binaries drive that CLI. See SETUP.md.
 name: release
 
 on:
@@ -37,13 +38,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: muse-bridge-linux-x86_64
+            http_asset: muse-bridge-linux-x86_64
+            acp_asset: muse-acp-bridge-linux-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: muse-bridge-windows-x86_64.exe
+            http_asset: muse-bridge-windows-x86_64.exe
+            acp_asset: muse-acp-bridge-windows-x86_64.exe
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: muse-bridge-macos-aarch64
+            http_asset: muse-bridge-macos-aarch64
+            acp_asset: muse-acp-bridge-macos-aarch64
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -54,22 +58,34 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
-      - name: smoke test (no muse present)
+      - name: package and smoke (no muse present)
         run: |
-          BIN="target/${{ matrix.target }}/release/${{ matrix.asset }}"
+          set -euo pipefail
+          rel="target/${{ matrix.target }}/release"
           case "${{ matrix.os }}" in
-            windows-latest) SRC="target/${{ matrix.target }}/release/muse-bridge.exe" ;;
-            *) SRC="target/${{ matrix.target }}/release/muse-bridge" ;;
+            windows-latest)
+              http_src="$rel/muse-bridge.exe"
+              acp_src="$rel/muse-acp-bridge.exe"
+              ;;
+            *)
+              http_src="$rel/muse-bridge"
+              acp_src="$rel/muse-acp-bridge"
+              ;;
           esac
-          cp "$SRC" "$BIN"
-          ./$BIN --help > /dev/null
+          cp "$http_src" "$rel/${{ matrix.http_asset }}"
+          cp "$acp_src" "$rel/${{ matrix.acp_asset }}"
+          "$rel/${{ matrix.http_asset }}" --help >/dev/null
           MUSE_CLI=definitely-not-a-real-binary \
-            ./$BIN --support 2>/dev/null | grep -q '"reachable": false'
-      - run: sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+            "$rel/${{ matrix.http_asset }}" --support 2>/dev/null | grep -q '"reachable": false'
+          "$rel/${{ matrix.acp_asset }}" --version | grep -q 'muse-acp '
+      - name: checksum and upload
         working-directory: target/${{ matrix.target }}/release
-      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
-        working-directory: target/${{ matrix.target }}/release
+        run: |
+          set -euo pipefail
+          for asset in "${{ matrix.http_asset }}" "${{ matrix.acp_asset }}"; do
+            sha256sum "$asset" > "$asset.sha256"
+            gh release upload "$TAG" "$asset" "$asset.sha256" --clobber
+          done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
-          ASSET: ${{ matrix.asset }}
