@@ -35,9 +35,13 @@ struct LiveAcp {
 
 impl LiveAcp {
     async fn connect() -> Self {
-        let supervisor = Supervisor::launch(HostConfig::from_env(std::env::temp_dir(), false))
-            .await
-            .expect("live launch");
+        let supervisor = Supervisor::launch(HostConfig::from_env(
+            std::env::temp_dir(),
+            false,
+            &HostConfig::host_bin_from_env(),
+        ))
+        .await
+        .expect("live launch");
         let dispatcher =
             Dispatcher::new(supervisor.clone(), None, "allowAll").expect("dispatcher setup");
         let (client_tx, server_rx) = tokio::io::duplex(256 * 1024);

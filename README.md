@@ -17,7 +17,7 @@ and serves it two ways:
 > surface for Zed/JetBrains (FORK_PLAN P1–P6 and parity P7–P9:
 > slash commands, skills, subagent/workflow display + control,
 > permission/user-input dialogs, MCP forwarding). Automated gates
-> green (314 tests, clippy, fmt — verified 2026-09-20; live-host
+> green (350 tests, clippy, fmt — verified 2026-09-24; live-host
 > suite green 2026-09-17, needs `muse login`).
 > Remaining: manual client-compat runs (Hermes, Codex, Desktop,
 > Zed, JetBrains) — release gates recorded in release notes.
@@ -40,6 +40,8 @@ muse-bridge                                     # listens on http://127.0.0.1:17
 muse-bridge --port 8646 --log-format pretty     # pretty logs, custom port
 muse-bridge --selftest                          # handshake + model/list + probe turn, exit 0/1
 muse-bridge --support                           # diagnostics bundle as JSON, exit 0
+muse-bridge serve --tailscale                   # install + start the background service
+muse-bridge serve --off                         # stop + disable it again
 ```
 
 Quick checks:

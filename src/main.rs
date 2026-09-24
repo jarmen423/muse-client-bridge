@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser as _;
-use muse_bridge::cli::{Cli, LogFormat};
+use muse_bridge::cli::{Cli, Command, LogFormat};
 use muse_bridge::dispatch::Dispatcher;
 use muse_bridge::http::{self, AppState};
 use muse_bridge::msp::host::{HostConfig, Supervisor};
@@ -47,6 +47,27 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging(cli.log_format);
 
+    if let Some(command) = &cli.command {
+        if cli.support || cli.selftest {
+            eprintln!("muse-bridge: --support/--selftest cannot be combined with a subcommand");
+            return ExitCode::from(USAGE);
+        }
+        match command {
+            Command::Serve(args) => {
+                // `Stdout` (not the `!Send` lock guard): each report line
+                // locks internally, which is plenty for a management command.
+                let mut out = std::io::stdout();
+                match muse_bridge::service::run_serve(args, &mut out).await {
+                    Ok(()) => return ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("muse-bridge: {}", e.message);
+                        return ExitCode::from(if e.usage { USAGE } else { FATAL });
+                    }
+                }
+            }
+        }
+    }
+
     if cli.support || cli.selftest {
         let cwd = match host_cwd(cli.workspace_root.as_ref()) {
             Ok(cwd) => cwd,
@@ -55,7 +76,7 @@ async fn main() -> ExitCode {
                 return ExitCode::from(if usage { USAGE } else { FATAL });
             }
         };
-        let host_config = HostConfig::from_env(cwd, cli.trust_workspace);
+        let host_config = HostConfig::from_env(cwd, cli.trust_workspace, &cli.muse_bin);
         if cli.support {
             muse_bridge::support::run_support(&host_config).await;
         }
@@ -139,8 +160,11 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
             "no --workspace-root: provider mode (the client owns the workspace; no workspaceRoot is sent)"
         );
     }
-    let host_config =
-        HostConfig::from_env(host_cwd(cli.workspace_root.as_ref())?, cli.trust_workspace);
+    let host_config = HostConfig::from_env(
+        host_cwd(cli.workspace_root.as_ref())?,
+        cli.trust_workspace,
+        &cli.muse_bin,
+    );
     let supervisor = Supervisor::launch(host_config)
         .await
         .map_err(|e| Fatal::runtime(e.to_string()))?;

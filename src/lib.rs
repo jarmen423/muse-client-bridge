@@ -10,5 +10,6 @@ pub mod cli;
 pub mod dispatch;
 pub mod http;
 pub mod msp;
+pub mod service;
 pub mod support;
 pub mod translate;

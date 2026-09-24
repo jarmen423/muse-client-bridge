@@ -79,16 +79,23 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    /// Resolve from flags + process env (production path).
-    pub fn from_env(cwd: PathBuf, trust_workspace: bool) -> Self {
-        let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    /// Backend binary from process env (`MUSE_CLI` or `muse`): the default
+    /// when the caller has no CLI flag of its own (ACP bridge, live tests).
+    pub fn host_bin_from_env() -> String {
+        std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string())
+    }
+
+    /// Resolve from flags + process env (production path). `muse_bin` is the
+    /// caller-resolved backend (clap flag over `MUSE_CLI` over `muse` for
+    /// `muse-bridge`; [`HostConfig::host_bin_from_env`] elsewhere).
+    pub fn from_env(cwd: PathBuf, trust_workspace: bool, muse_bin: &str) -> Self {
         let mut serve_args =
             split_serve_args(&std::env::var("MUSE_SERVE_ARGS").unwrap_or_default());
         if trust_workspace && !serve_args.iter().any(|a| a == "--trust-workspace") {
             serve_args.push("--trust-workspace".to_string());
         }
         Self {
-            bin,
+            bin: muse_bin.to_string(),
             subcommand: Some("serve".to_string()),
             serve_args,
             cwd,

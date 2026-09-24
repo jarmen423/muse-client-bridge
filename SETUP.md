@@ -77,20 +77,34 @@ Expect three `PASS` lines and exit 0. If you see a `HINT` about
 bridge), then retry.
 
 ```sh
-./target/release/muse-bridge &
+./target/release/muse-bridge serve
 curl http://127.0.0.1:17489/healthz
 curl http://127.0.0.1:17489/v1/models
 ```
 
 Both should answer. `GET /v1/models` lists the live model ids; use
 those exact strings in client configs, since the catalog changes
-server-side.
+server-side. (Run `./target/release/muse-bridge` with no subcommand to
+watch the logs in the foreground instead.)
 
 ## Everyday running
 
 ```sh
-muse-bridge [--trust-workspace] [--port N]
+muse-bridge serve --tailscale    # install + start the background service (autostarts at login)
+muse-bridge serve --status       # service state + /healthz (exit 0 iff healthy)
+muse-bridge serve --off          # stop + disable (add --tailscale to also drop the forward)
 ```
+
+`serve` is the installer: it writes a user-level autostart definition —
+systemd user unit on Linux, LaunchAgent on macOS, logon Scheduled Task
+on Windows — enables and starts it, and verifies `/healthz`. The
+definition stays after `--off`, so re-enabling is one command. Config
+flags (`--port`, `--workspace-root`, `--approval-mode`, `--muse-bin`,
+`--trust-workspace`, `--log-format`) bake into the definition; re-run
+`serve` after changing them or moving the binary, and restart the
+service after rebuilding. `serve --dry-run` prints the plan without
+touching anything. Export `MUSE_BRIDGE_TAILSCALE=true` to manage
+the forward on every `serve`/`--off` without repeating `--tailscale`.
 
 - No workspace config needed: by default the bridge runs in
   provider mode — the client owns the project/workspace, the bridge
@@ -107,7 +121,8 @@ muse-bridge [--trust-workspace] [--port N]
   model-visible message instead of parking on a dialog.
 - Env overrides: `MUSE_BRIDGE_PORT`, `MUSE_CLI` (muse binary path),
   `MUSE_SERVE_ARGS` (extra args for `muse serve`), `RUST_LOG`
-  (`debug` logs message content; never share those logs blindly).
+  (`debug` logs message content; never share those logs blindly),
+  `MUSE_BRIDGE_TAILSCALE=true` (manage the forward on every `serve`).
 
 ## Hermes: main provider
 
@@ -185,6 +200,8 @@ Desktop after writing.
 | `failed to bind 127.0.0.1:17489` | Something owns the port (historical note: pre-release default `18789` collided with OpenClaw). Pass `--port` / `MUSE_BRIDGE_PORT`. |
 | Codex warns `Model metadata ... not found` | Point `model_catalog_json` at the example catalog. |
 | `muse: command not found` | Put `muse` on `PATH` or set `MUSE_CLI=/path/to/muse`. On Windows that file is `muse.cmd`. v0.1.2 and later launch it. |
+| `serve --tailscale`: tailscale access denied | Run `sudo tailscale set --operator=$USER` once, then re-run. |
+| Service stops at logout (Linux) | `sudo loginctl enable-linger $USER` (needs root). |
 
 `muse-bridge --support` prints a JSON bundle (versions, fingerprint
 pin vs live, stderr tail) for bug reports.

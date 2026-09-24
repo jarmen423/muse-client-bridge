@@ -66,7 +66,7 @@ async fn run() -> Result<(), String> {
     std::fs::create_dir_all(&cwd)
         .map_err(|e| format!("cannot create inert host dir {}: {e}", cwd.display()))?;
     let trust_workspace = std::env::var("MUSE_TRUST_WORKSPACE").as_deref() == Ok("1");
-    let host_config = HostConfig::from_env(cwd, trust_workspace);
+    let host_config = HostConfig::from_env(cwd, trust_workspace, &HostConfig::host_bin_from_env());
     let supervisor = Supervisor::launch(host_config)
         .await
         .map_err(|e| format!("msp host launch failed: {e}"))?;

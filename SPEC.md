@@ -445,9 +445,19 @@ with an `{"error":…}` data frame. The bridge does that for chat, and
   [--support] [--selftest]`. `--support` prints versions,
   fingerprint pin vs live, last stderr tail; `--selftest` runs
   handshake + `model/list` + empty-turn probe and exits 0/1.
+- CLI: `muse-bridge serve [--off] [--tailscale] [--status] [--dry-run]
+  [--port N] [--workspace-root <dir>] [--approval-mode M] [--muse-bin B]
+  [--trust-workspace] [--log-format json|pretty]`. Installs/enables/starts
+  a user-level autostart service (systemd user unit, macOS LaunchAgent,
+  Windows logon task), verifies `/healthz`, exits 0/1. `--off`
+  stops+disables (definition kept), `--status` reports (exit 0 iff
+  healthy), `--tailscale` manages the `tailscale serve --tcp=<port>`
+  forward with scoped removal (never `reset`). The baked backend resolves
+  to an absolute path at install time; a missing backend fails the install
+  instead of a crash-looping service.
 - Env: `MUSE_CLI`, `MUSE_SERVE_ARGS`, `MUSE_COMMAND_TIMEOUT_MS`,
-  `MUSE_BRIDGE_PORT`, `RUST_LOG` — same names as muse-acp where
-  they overlap.
+  `MUSE_BRIDGE_PORT`, `MUSE_BRIDGE_TAILSCALE`, `RUST_LOG` — same names
+  as muse-acp where they overlap.
 - Logging: structured `tracing` events (request id, session id,
   turn id, view cursors, MSP `data.kind` on errors). No `println!`
   in shipped code. Never log message content above `debug`, never

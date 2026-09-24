@@ -16,7 +16,11 @@ fn live_enabled() -> bool {
 }
 
 fn live_config() -> HostConfig {
-    HostConfig::from_env(std::env::temp_dir(), false)
+    HostConfig::from_env(
+        std::env::temp_dir(),
+        false,
+        &HostConfig::host_bin_from_env(),
+    )
 }
 
 struct LiveServer {

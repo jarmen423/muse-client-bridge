@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Default TCP port for the loopback listener.
 pub const DEFAULT_PORT: u16 = 17489;
@@ -77,6 +77,71 @@ pub struct Cli {
     /// exit 0 on success, 1 on failure.
     #[arg(long)]
     pub selftest: bool,
+
+    /// Background-service management. Absent = run the server in the
+    /// foreground (unchanged default).
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// `muse-bridge` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Install and start the background service (or stop it with `--off`).
+    Serve(ServeArgs),
+}
+
+/// `muse-bridge serve`: user-level autostart service lifecycle.
+///
+/// On Linux this writes a systemd user unit, on macOS a LaunchAgent plist,
+/// on Windows a logon Scheduled Task — then enables and starts it and
+/// verifies `/healthz`. `serve --off` stops and disables (the definition
+/// file stays so re-enabling is cheap). The service always binds loopback;
+/// remote exposure goes through the optional Tailscale TCP forward.
+#[derive(Debug, Clone, Args)]
+pub struct ServeArgs {
+    /// Stop and disable the background service (undoes `serve`).
+    #[arg(long)]
+    pub off: bool,
+
+    /// Also manage the Tailscale TCP forward for the bridge port
+    /// (`tailscale serve --bg --tcp=<port> tcp://127.0.0.1:<port>`,
+    /// removed by `--off --tailscale`). Set `MUSE_BRIDGE_TAILSCALE=true`
+    /// to manage it on every `serve` without repeating the flag.
+    #[arg(long, env = "MUSE_BRIDGE_TAILSCALE")]
+    pub tailscale: bool,
+
+    /// Report service + health status; exit 0 iff `/healthz` answers.
+    #[arg(long)]
+    pub status: bool,
+
+    /// Print the install plan (file content + commands) without running it.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// TCP port baked into the service definition.
+    #[arg(long)]
+    pub port: Option<u16>,
+
+    /// Workspace root handed to MSP `session/start` as `workspaceRoot`.
+    #[arg(long)]
+    pub workspace_root: Option<PathBuf>,
+
+    /// MSP session approval mode (`allowAll|promptUnmatched|onRequest|denyUnmatched`).
+    #[arg(long)]
+    pub approval_mode: Option<String>,
+
+    /// `muse` binary path (or bare name resolved via PATH).
+    #[arg(long)]
+    pub muse_bin: Option<String>,
+
+    /// Pass `--trust-workspace` through to `muse serve`.
+    #[arg(long)]
+    pub trust_workspace: bool,
+
+    /// Bridge log output format.
+    #[arg(long, value_enum)]
+    pub log_format: Option<LogFormat>,
 }
 
 impl Cli {
@@ -121,6 +186,10 @@ mod tests {
         assert_eq!(cli.log_format, LogFormat::Pretty);
         assert!(!cli.support);
         assert!(!cli.selftest);
+        assert!(
+            cli.command.is_none(),
+            "bare invocation runs the foreground server"
+        );
     }
 
     #[test]
@@ -203,5 +272,91 @@ mod tests {
             std::env::remove_var("MUSE_SERVE_ARGS");
         }
         assert!(Cli::serve_args().is_empty());
+    }
+
+    fn serve_args(args: &[&str]) -> ServeArgs {
+        let cli = parse(args);
+        let Some(Command::Serve(serve)) = cli.command else {
+            panic!("expected `serve` subcommand, got {:?}", cli.command);
+        };
+        serve
+    }
+
+    #[test]
+    fn serve_parses_with_flag_defaults() {
+        let _guard = env_lock();
+        let serve = serve_args(&["muse-bridge", "serve"]);
+        assert!(!serve.off);
+        assert!(!serve.tailscale);
+        assert!(!serve.status);
+        assert!(!serve.dry_run);
+        assert_eq!(serve.port, None);
+        assert_eq!(serve.workspace_root, None);
+        assert_eq!(serve.approval_mode, None);
+        assert_eq!(serve.muse_bin, None);
+        assert!(!serve.trust_workspace);
+        assert_eq!(serve.log_format, None);
+    }
+
+    #[test]
+    fn serve_parses_every_flag() {
+        let _guard = env_lock();
+        let serve = serve_args(&[
+            "muse-bridge",
+            "serve",
+            "--off",
+            "--tailscale",
+            "--dry-run",
+            "--port",
+            "8646",
+            "--workspace-root",
+            "/tmp/ws",
+            "--approval-mode",
+            "allowAll",
+            "--muse-bin",
+            "/opt/muse",
+            "--trust-workspace",
+            "--log-format",
+            "json",
+        ]);
+        assert!(serve.off);
+        assert!(serve.tailscale);
+        assert!(serve.dry_run);
+        assert!(!serve.status);
+        assert_eq!(serve.port, Some(8646));
+        assert_eq!(serve.workspace_root, Some(PathBuf::from("/tmp/ws")));
+        assert_eq!(serve.approval_mode, Some("allowAll".to_string()));
+        assert_eq!(serve.muse_bin, Some("/opt/muse".to_string()));
+        assert!(serve.trust_workspace);
+        assert_eq!(serve.log_format, Some(LogFormat::Json));
+    }
+
+    #[test]
+    fn serve_status_parses() {
+        let _guard = env_lock();
+        let serve = serve_args(&["muse-bridge", "serve", "--status", "--tailscale"]);
+        assert!(serve.status);
+        assert!(serve.tailscale);
+        assert!(!serve.off);
+    }
+
+    #[test]
+    #[allow(unsafe_code, reason = "process-env mutation for env-precedence tests")]
+    fn env_enables_tailscale_management() {
+        let _guard = env_lock();
+        // SAFETY: serialized by the module lock; see above.
+        unsafe {
+            std::env::set_var("MUSE_BRIDGE_TAILSCALE", "true");
+        }
+        let serve = serve_args(&["muse-bridge", "serve"]);
+        assert!(
+            serve.tailscale,
+            "MUSE_BRIDGE_TAILSCALE=true manages the forward"
+        );
+        unsafe {
+            std::env::remove_var("MUSE_BRIDGE_TAILSCALE");
+        }
+        let serve = serve_args(&["muse-bridge", "serve"]);
+        assert!(!serve.tailscale, "unset env leaves the forward alone");
     }
 }
